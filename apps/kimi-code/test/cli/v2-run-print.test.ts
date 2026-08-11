@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  IAgentCatalogRuntimeOptions,
   IAgentGoalService,
   IAgentLifecycleService,
   IAgentPermissionModeService,
@@ -18,12 +17,13 @@ import {
   IEventBus,
   IFileSystemStorageService,
   IOAuthToolkit,
+  ISessionCronService,
   ISessionIndex,
   ISessionLifecycleService,
-  ISkillCatalogRuntimeOptions,
+  IWorkspaceLifecycleService,
   ITelemetryService,
+  type BootstrapInput,
   type DomainEvent,
-  type ScopeSeed,
 } from '@moonshot-ai/agent-core-v2';
 
 import { runV2Print } from '../../src/cli/v2/run-v2-print';
@@ -173,18 +173,12 @@ function makeFakeHarness() {
   const sessionServices = new Map<unknown, unknown>([
     // drain enumerates agents; empty → no background work to wait on.
     [IAgentLifecycleService, { list: vi.fn(() => []) }],
+    // No scheduled cron tasks → no future fire time to wait on.
+    [ISessionCronService, { getNextFireTime: vi.fn(() => null) }],
   ]);
   const session = fakeScope('ses_v2', sessionServices);
 
-  const appServices = new Map<unknown, unknown>([
-    [
-      IConfigService,
-      {
-        ready: Promise.resolve(),
-        get: vi.fn((section: string) => (section === 'defaultModel' ? 'k2' : undefined)),
-        diagnostics: vi.fn(() => []),
-      },
-    ],
+  const handlerServices = new Map<unknown, unknown>([
     [
       ISessionLifecycleService,
       {
@@ -192,13 +186,53 @@ function makeFakeHarness() {
         resume: vi.fn(async () => session),
       },
     ],
-    [ISessionIndex, { list: vi.fn(async () => ({ items: [] })) }],
+  ]);
+  const workspace = fakeScope('wd_v2', handlerServices);
+
+  const appServices = new Map<unknown, unknown>([
+    [
+      IConfigService,
+      {
+        ready: Promise.resolve(),
+        get: vi.fn((section: string) => (section === 'defaultModel' ? 'k2' : undefined)),
+        // `applyPrintModeConfigDefaults` inspects each section and fills unset
+        // keys via the memory layer; an empty section means everything is unset.
+        inspect: vi.fn(() => ({ value: {} })),
+        set: vi.fn(async () => {}),
+        diagnostics: vi.fn(() => []),
+      },
+    ],
+    [
+      IWorkspaceLifecycleService,
+      {
+        handlerFor: vi.fn(async () => workspace),
+      },
+    ],
+    [
+      ISessionIndex,
+      {
+        list: vi.fn(async () => ({ items: [] })),
+        get: vi.fn(async (id: string) => ({
+          id,
+          workspaceId: 'wd_v2',
+          cwd: process.cwd(),
+          createdAt: 1,
+          updatedAt: 1,
+          archived: false,
+        })),
+      },
+    ],
+    [ISessionIndex, { get: vi.fn(async () => undefined), listRecent: vi.fn(async () => ({ items: [] })) }],
     [
       IBootstrapService,
       {
         platform: 'linux',
         arch: 'x64',
-        clientVersion: '1.2.3-test',
+        clientIdentity: {
+          productName: 'test-product',
+          version: '1.2.3-test',
+          platform: 'test_platform',
+        },
         osHomeDir: '/home/test',
         getEnv: () => undefined,
       },
@@ -221,7 +255,7 @@ function makeFakeHarness() {
     ],
   ]);
   const app = fakeScope('app', appServices);
-  return { app, agent, session, agentServices, appServices, profileState };
+  return { app, agent, session, agentServices, appServices, handlerServices, profileState };
 }
 
 describe('runV2Print', () => {
@@ -260,7 +294,7 @@ describe('runV2Print', () => {
     expect(app.dispose).toHaveBeenCalled();
   });
 
-  it('seeds explicit skill dirs from --skillsDir into bootstrap', async () => {
+  it('passes explicit skill dirs from --skillsDir into bootstrap args', async () => {
     const stdout = writer();
     const stderr = writer();
     const { app, agent } = makeFakeHarness();
@@ -273,12 +307,11 @@ describe('runV2Print', () => {
       stderr,
     });
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    const seeded = seeds.find(([id]) => id === ISkillCatalogRuntimeOptions);
-    expect(seeded?.[1]).toMatchObject({ explicitDirs: ['/skills'] });
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.skillDirs).toEqual(['/skills']);
   });
 
-  it('leaves the skill runtime options unseeded when --skillsDir is empty', async () => {
+  it('leaves the skill dirs arg unset when --skillsDir is empty', async () => {
     const stdout = writer();
     const stderr = writer();
     const { app, agent } = makeFakeHarness();
@@ -288,14 +321,14 @@ describe('runV2Print', () => {
 
     await runV2Print(opts() as never, '1.2.3-test', { stdout, stderr });
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    expect(seeds.some(([id]) => id === ISkillCatalogRuntimeOptions)).toBe(false);
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.skillDirs ?? []).toEqual([]);
   });
 
   it('seeds explicit agent files from --agentFile and binds the --agent profile', async () => {
     const stdout = writer();
     const stderr = writer();
-    const { app, agent, appServices, agentServices } = makeFakeHarness();
+    const { app, agent, appServices, agentServices, handlerServices } = makeFakeHarness();
 
     mocks.bootstrap.mockReturnValue({ app });
     mocks.ensureMainAgent.mockResolvedValue(agent);
@@ -306,11 +339,10 @@ describe('runV2Print', () => {
       { stdout, stderr },
     );
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    const seeded = seeds.find(([id]) => id === IAgentCatalogRuntimeOptions);
-    expect(seeded?.[1]).toMatchObject({ explicitFiles: ['/agents/reviewer.md'] });
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.agentFiles).toEqual(['/agents/reviewer.md']);
 
-    const lifecycle = appServices.get(ISessionLifecycleService) as {
+    const lifecycle = handlerServices.get(ISessionLifecycleService) as {
       create: ReturnType<typeof vi.fn>;
     };
     expect(lifecycle.create).toHaveBeenCalledWith({
@@ -331,7 +363,7 @@ describe('runV2Print', () => {
     );
     const stdout = writer();
     const stderr = writer();
-    const { app, agent, appServices, agentServices } = makeFakeHarness();
+    const { app, agent, appServices, agentServices, handlerServices } = makeFakeHarness();
 
     mocks.bootstrap.mockReturnValue({ app });
     mocks.ensureMainAgent.mockResolvedValue(agent);
@@ -341,11 +373,10 @@ describe('runV2Print', () => {
       stderr,
     });
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    const seeded = seeds.find(([id]) => id === IAgentCatalogRuntimeOptions);
-    expect(seeded?.[1]).toMatchObject({ explicitFiles: [agentFile] });
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.agentFiles).toEqual([agentFile]);
 
-    const lifecycle = appServices.get(ISessionLifecycleService) as {
+    const lifecycle = handlerServices.get(ISessionLifecycleService) as {
       create: ReturnType<typeof vi.fn>;
     };
     expect(lifecycle.create).toHaveBeenCalledWith({
@@ -360,8 +391,8 @@ describe('runV2Print', () => {
   it('does not materialize a main agent after fresh profile binding fails', async () => {
     const stdout = writer();
     const stderr = writer();
-    const { app, appServices } = makeFakeHarness();
-    const lifecycle = appServices.get(ISessionLifecycleService) as {
+    const { app, handlerServices } = makeFakeHarness();
+    const lifecycle = handlerServices.get(ISessionLifecycleService) as {
       create: ReturnType<typeof vi.fn>;
     };
     lifecycle.create.mockRejectedValueOnce(new Error('Unknown agent profile'));
@@ -395,7 +426,7 @@ describe('runV2Print', () => {
     expect(profile.bind).not.toHaveBeenCalled();
   });
 
-  it('leaves the agent runtime options unseeded when --agentFile is empty', async () => {
+  it('leaves the agent files arg unset when --agentFile is empty', async () => {
     const stdout = writer();
     const stderr = writer();
     const { app, agent } = makeFakeHarness();
@@ -405,8 +436,8 @@ describe('runV2Print', () => {
 
     await runV2Print(opts() as never, '1.2.3-test', { stdout, stderr });
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    expect(seeds.some(([id]) => id === IAgentCatalogRuntimeOptions)).toBe(false);
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.agentFiles ?? []).toEqual([]);
   });
 
   it('passes --agent-file paths through unresolved so the engine can expand ~', async () => {
@@ -423,9 +454,8 @@ describe('runV2Print', () => {
       { stdout, stderr },
     );
 
-    const seeds = mocks.bootstrap.mock.calls[0]?.[1] as ScopeSeed;
-    const seeded = seeds.find(([id]) => id === IAgentCatalogRuntimeOptions);
-    expect(seeded?.[1]).toMatchObject({ explicitFiles: ['~/agents/reviewer.md'] });
+    const input = mocks.bootstrap.mock.calls[0]?.[0] as BootstrapInput;
+    expect(input.args?.agentFiles).toEqual(['~/agents/reviewer.md']);
   });
 
   it('treats re-selecting the already-bound profile on resume as a no-op', async () => {
@@ -434,8 +464,8 @@ describe('runV2Print', () => {
     const { app, agent, agentServices, appServices, profileState } = makeFakeHarness();
     profileState.profileName = 'reviewer';
 
-    const index = appServices.get(ISessionIndex) as { list: ReturnType<typeof vi.fn> };
-    index.list.mockResolvedValue({ items: [{ id: 'ses_1', cwd: process.cwd() }] });
+    const index = appServices.get(ISessionIndex) as { get: ReturnType<typeof vi.fn> };
+    index.get.mockResolvedValue({ id: 'ses_1', cwd: process.cwd() });
 
     mocks.bootstrap.mockReturnValue({ app });
     mocks.ensureMainAgent.mockResolvedValue(agent);
@@ -459,8 +489,8 @@ describe('runV2Print', () => {
     const { app, agent, agentServices, appServices, profileState } = makeFakeHarness();
     profileState.profileName = 'reviewer';
 
-    const index = appServices.get(ISessionIndex) as { list: ReturnType<typeof vi.fn> };
-    index.list.mockResolvedValue({ items: [{ id: 'ses_1', cwd: process.cwd() }] });
+    const index = appServices.get(ISessionIndex) as { get: ReturnType<typeof vi.fn> };
+    index.get.mockResolvedValue({ id: 'ses_1', cwd: process.cwd() });
 
     mocks.bootstrap.mockReturnValue({ app });
     mocks.ensureMainAgent.mockResolvedValue(agent);

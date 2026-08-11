@@ -32,16 +32,17 @@ import { IConfigService } from '#/app/config/config';
 import { ConfigRegistry } from '#/app/config/configService';
 import { type DomainEvent, IEventService } from '#/app/event/event';
 import { ILogService } from '#/_base/log/log';
-import { IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
-import { MODELS_SECTION, type ModelRecord } from '#/kosong/model/model';
+import { IAgentIdentity } from '#/app/agentIdentity/agentIdentity';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
+import { IModelService, type ModelRecord } from '#/kosong/model/model';
+import { MODELS_SECTION } from '#/app/kosongConfig/configSection';
 import { IProviderService, type ProviderConfig, type ProvidersChangedEvent } from '#/kosong/provider/provider';
 
-// Side-effect registration: the OAuth-catalog verdict
-// (`isOAuthCatalogProvider`) answers through the provider-definition registry.
 import '#/kosong/provider/providers/kimi/kimi.contrib';
 
 import { registerBootstrapServices } from '../bootstrap/stubs';
 import { registerTelemetryServices } from '../telemetry/stubs';
+import { stubAgentIdentity } from '../../app/agentIdentity/stubs';
 
 const OAUTH_PROVIDER = 'managed:kimi-code';
 const NON_OAUTH_PROVIDER = 'openai-main';
@@ -78,6 +79,7 @@ interface FakeToolkit {
   readonly getCachedAccessToken: ReturnType<typeof vi.fn>;
   readonly tokenProvider: ReturnType<typeof vi.fn>;
   readonly getManagedUsage: ReturnType<typeof vi.fn>;
+  readonly getManagedUserInfo: ReturnType<typeof vi.fn>;
 }
 
 describe('OAuthService', () => {
@@ -154,6 +156,7 @@ describe('OAuthService', () => {
       getCachedAccessToken: vi.fn().mockResolvedValue(undefined),
       tokenProvider: vi.fn().mockReturnValue({ getAccessToken: async () => 'access-token' }),
       getManagedUsage: vi.fn().mockResolvedValue({ kind: 'error', message: 'not configured' }),
+      getManagedUserInfo: vi.fn().mockResolvedValue({ kind: 'error', message: 'not configured' }),
     };
     ix = createServices(disposables, {
       base: [registerBootstrapServices, registerTelemetryServices],
@@ -162,7 +165,7 @@ describe('OAuthService', () => {
           get: ((name: string) => providers[name]) as IProviderService['get'],
           list: (() => providers) as IProviderService['list'],
           set: providerSet as unknown as IProviderService['set'],
-          onDidChangeProviders: providerChangedEmitter.event,
+          onDidChangeProviders: providerChangedEmitter.event as IProviderService['onDidChangeProviders'],
         });
         reg.definePartialInstance(IConfigService, {
           get: ((domain: string) => configBacking()[domain]) as IConfigService['get'],
@@ -692,6 +695,30 @@ describe('OAuthService', () => {
     });
   });
 
+  it('getManagedUserInfo resolves the managed runtime auth and delegates to the toolkit', async () => {
+    const userInfo = {
+      kind: 'ok' as const,
+      userInfo: {
+        userId: 'u_1',
+        nickname: 'moonwalker',
+        status: 'USER_STATUS_NORMAL',
+        region: 'REGION_CN',
+        userLevel: 30,
+        userLevelName: 'Vivace',
+        domain: 1,
+        domainName: 'DOMAIN_EXAMPLE',
+      },
+    };
+    toolkit.getManagedUserInfo.mockResolvedValue(userInfo);
+    const svc = createService();
+
+    await expect(svc.getManagedUserInfo(OAUTH_PROVIDER)).resolves.toBe(userInfo);
+    expect(toolkit.getManagedUserInfo).toHaveBeenCalledWith(OAUTH_PROVIDER, {
+      oauthRef: EXAMPLE_COM_SCOPED_REF,
+      baseUrl: 'https://api.example.com',
+    });
+  });
+
   it('refreshOAuthProviderModels returns an empty result when no Kimi Code provider is configured', async () => {
     providers = { [NON_OAUTH_PROVIDER]: { type: 'openai', apiKey: 'sk-test' } };
     const svc = createService();
@@ -808,11 +835,16 @@ describe('WebSearchProviderService', () => {
           resolveTokenProvider:
             resolveTokenProvider as unknown as IOAuthService['resolveTokenProvider'],
         });
-        reg.definePartialInstance(IHostRequestHeaders, {
-          headers: {
-            'User-Agent': 'kimi-code-cli/test',
-            'X-Msh-Device-Id': 'device-test',
-          },
+        const hostHeaders = {
+          'User-Agent': 'kimi-code-cli/test',
+          'X-Msh-Device-Id': 'device-test',
+        };
+        reg.defineInstance(
+          IAgentIdentity,
+          stubAgentIdentity({ hostRequestHeaders: hostHeaders }),
+        );
+        reg.definePartialInstance(IBootstrapService, {
+          args: { requestHeaders: hostHeaders },
         });
         reg.definePartialInstance(IConfigService, {
           get: ((domain: string) =>
@@ -996,6 +1028,51 @@ describe('WebSearchProviderService', () => {
     expect(createService().getWebSearchProvider()).toBeUndefined();
     expect(resolveTokenProvider).not.toHaveBeenCalled();
   });
+
+  // Tool activation gates on presence alone. An env-configured endpoint is
+  // visible before config finishes loading, so a fast bootstrap can evaluate
+  // the gate before the identity snapshot froze — presence must not read it.
+  it('answers presence without touching a not-yet-frozen identity', () => {
+    const notFrozen: IAgentIdentity = {
+      _serviceBrand: undefined,
+      resolved: () => new Promise(() => undefined),
+      current: () => {
+        throw new Error('identity read before freeze');
+      },
+    };
+    servicesConfig = {
+      moonshotSearch: { baseUrl: 'https://search.example.com/search', apiKey: 'k' },
+    };
+    const svc = new WebSearchProviderService(
+      { get: ((name: string) => providers[name]) as IProviderService['get'] } as IProviderService,
+      {
+        resolveTokenProvider:
+          resolveTokenProvider as unknown as IOAuthService['resolveTokenProvider'],
+      } as IOAuthService,
+      { args: { requestHeaders: {} } } as unknown as IBootstrapService,
+      {
+        get: ((domain: string) =>
+          domain === SERVICES_SECTION ? servicesConfig : undefined) as IConfigService['get'],
+      } as IConfigService,
+      notFrozen,
+    );
+
+    expect(svc.hasWebSearchProvider()).toBe(true);
+    expect(() => svc.getWebSearchProvider()).toThrow(/before freeze/);
+
+    servicesConfig = undefined;
+    providers = {};
+    expect(svc.hasWebSearchProvider()).toBe(false);
+
+    providers = {
+      [OAUTH_PROVIDER]: {
+        type: 'kimi',
+        baseUrl: 'https://api.example.com/v1',
+        oauth: { storage: 'file', key: 'oauth/kimi-code' },
+      },
+    };
+    expect(svc.hasWebSearchProvider()).toBe(true);
+  });
 });
 
 describe('services config section', () => {
@@ -1141,6 +1218,11 @@ describe('AuthSummaryService', () => {
           get: ((name: string) => providers[name]) as IProviderService['get'],
           list: (() => providers) as IProviderService['list'],
         });
+        reg.definePartialInstance(IModelService, {
+          get: ((id: string) => models[id]) as IModelService['get'],
+          list: (() => models) as IModelService['list'],
+          getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
+        });
         reg.definePartialInstance(IConfigService, {
           get: ((domain: string) => {
             if (domain === MODELS_SECTION) return models;
@@ -1277,6 +1359,10 @@ describe('AuthLegacyService', () => {
       additionalServices: (reg) => {
         reg.definePartialInstance(IProviderService, {
           list: (() => providers) as IProviderService['list'],
+        });
+        reg.definePartialInstance(IModelService, {
+          ready: Promise.resolve(),
+          getDefaultModel: (() => defaultModel) as IModelService['getDefaultModel'],
         });
         reg.definePartialInstance(IConfigService, {
           ready: Promise.resolve(),

@@ -1,15 +1,21 @@
 /**
- * `toolExecutor` domain (L3) — Agent-scope tool execution contract.
+ * `toolExecutor` domain — Agent-scope tool execution contract.
  *
- * Defines the public execution surface for provider tool calls, will/did
- * execution hooks, tool-call result settlement, duplicate-call tagging for
- * telemetry, and preflight description extension points. Bound at Agent scope.
+ * Defines the public execution surface for provider tool calls, the
+ * before/will execution-interception events, the did execution hook,
+ * tool-call result settlement, duplicate-call tagging for telemetry, and
+ * preflight description extension points. Bound at Agent scope.
  */
 
 import { createDecorator } from '#/_base/di/instantiation';
 import type { IDisposable } from '#/_base/di/lifecycle';
+import type { Event } from '#/_base/event';
 import type { ToolResult } from '#/tool/toolContract';
-import type { ToolDidExecuteContext, ToolBeforeExecuteContext } from '#/agent/toolExecutor/toolHooks';
+import type {
+  BeforeToolExecuteEvent,
+  ToolDidExecuteContext,
+  WillExecuteToolEvent,
+} from '#/agent/toolExecutor/toolHooks';
 import type { ToolCall } from '#/kosong/contract/message';
 import type { OrderedHookSlot } from '#/hooks';
 import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
@@ -48,8 +54,11 @@ export interface IAgentToolExecutorService {
 
   execute(calls: ToolCall[], options: ToolExecutorExecuteOptions): AsyncIterable<ToolExecutionResult>;
 
+  readonly onBeforeExecuteTool: Event<BeforeToolExecuteEvent>;
+
+  readonly onWillExecuteTool: Event<WillExecuteToolEvent>;
+
   readonly hooks: {
-    readonly onBeforeExecuteTool: OrderedHookSlot<ToolBeforeExecuteContext>;
     readonly onDidExecuteTool: OrderedHookSlot<ToolDidExecuteContext>;
   };
 

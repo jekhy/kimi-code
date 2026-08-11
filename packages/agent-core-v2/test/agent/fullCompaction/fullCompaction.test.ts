@@ -36,20 +36,22 @@ import { MASTER_ENV } from '#/app/flag/flagService';
 import { estimateTokensForMessages } from '#/kosong/contract/tokens';
 import { recordingTelemetry, type TelemetryRecord } from '../../app/telemetry/stubs';
 import type { TestAgentContext, TestAgentOptions, TestAgentServiceOverride } from '../../harness';
-import { appServices, createCommandRunner, execEnvServices, hostEnvironmentServices, sessionServices, testAgent } from '../../harness';
+import { agentService, appServices, createCommandRunner, execEnvServices, hostEnvironmentServices, sessionServices, testAgent } from '../../harness';
+import { IAgentToolSelectAnnouncementsService } from '#/agent/toolSelect/toolSelectAnnouncements';
 import {
   IAgentFullCompactionService,
-  IOAuthService,
+  IModelOAuthTokens,
   IAgentProfileService,
   IAgentToolRegistryService,
   ISessionTodoService,
   DYNAMIC_TOOL_SCHEMA_VARIANT,
+  normalizeAgentProfile,
   type ExecutableTool,
   type ResolvedAgentProfile,
   type ToolExecution,
 } from '#/index';
 import { IAgentLoopService } from '#/agent/loop/loop';
-import { IAgentContextSizeService } from '#/agent/contextSize/contextSize';
+import { IAgentTokenCountingService } from '#/agent/tokenCounting/tokenCounting';
 import { IAgentGoalService } from '#/agent/goal/goal';
 import { IAgentTelemetryContextService } from '#/app/telemetry/agentTelemetryContext';
 import { HostFileSystem } from '#/os/backends/node-local/hostFsService';
@@ -80,7 +82,7 @@ const SNAPSHOT_VISIBLE_TOOLS = [
   'ExitPlanMode',
 ] as const;
 const LARGE_MCP_TOOL = 'mcp__srv__large';
-const EXACT_COMPACTION_REFRESH_PROFILE: ResolvedAgentProfile = {
+const EXACT_COMPACTION_REFRESH_PROFILE: ResolvedAgentProfile = normalizeAgentProfile({
   name: 'exact-compaction-refresh',
   systemPrompt: (context) =>
     [
@@ -92,7 +94,7 @@ const EXACT_COMPACTION_REFRESH_PROFILE: ResolvedAgentProfile = {
       `extra:${context.additionalDirsInfo ?? ''}`,
     ].join('\n'),
   tools: ['Read', 'Write', 'Skill'],
-};
+});
 
 describe('FullCompaction', () => {
   it('keeps an oversized trailing user message as recent', () => {
@@ -301,7 +303,7 @@ describe('FullCompaction', () => {
       properties: expect.objectContaining({
         agent_id: 'main',
         source: 'manual',
-        tokens_before: 39,
+        tokens_before: 3_299,
         tokens_after: expect.any(Number),
         duration_ms: expect.any(Number),
         compacted_count: 6,
@@ -542,7 +544,7 @@ describe('FullCompaction', () => {
       session_id: 'test-session',
       cwd: dir,
       trigger: 'auto',
-      token_count: 39,
+      token_count: 3_299,
     });
     expect(post).toMatchObject({
       hook_event_name: 'PostCompact',
@@ -628,7 +630,7 @@ describe('FullCompaction', () => {
       event: 'compaction_finished',
       properties: expect.objectContaining({
         source: 'manual',
-        tokens_before: 25,
+        tokens_before: 14_365,
         retry_count: 1,
         trace_id: 'trace-compact-1',
       }),
@@ -1011,7 +1013,7 @@ describe('FullCompaction', () => {
       properties: expect.objectContaining({
         agent_id: 'main',
         source: 'manual',
-        tokens_before: 25,
+        tokens_before: 14_365,
         duration_ms: expect.any(Number),
         round: 1,
         retry_count: 0,
@@ -1054,9 +1056,6 @@ describe('FullCompaction', () => {
 
   it('attributes compaction_failed to the in-flight request trace on a mid-stream failure', async () => {
     const records: TelemetryRecord[] = [];
-    // The stream delivers response headers (trace id) and one part, then fails
-    // — the error itself carries no trace, so attribution must come from the
-    // trace captured when the headers arrived.
     const generate = realKosongGenerate(() => {
       const base = mockStreamedMessage([], 'trace-mid-stream');
       return {
@@ -1121,6 +1120,7 @@ describe('FullCompaction', () => {
             code: 'compaction.failed',
             message: 'APIStatusError: Bad request',
           }),
+          interruptReason: 'error',
         },
       }),
     );
@@ -1144,7 +1144,6 @@ describe('FullCompaction', () => {
     const generate: GenerateFn = async (_chat, _systemPrompt, _tools, _history, _callbacks, options) => {
       signal = options?.signal;
       started.resolve();
-      // Never settles — the compaction stays in flight until disposed.
       return new Promise(() => {});
     };
     const ctx = testAgent({ generate });
@@ -1239,7 +1238,7 @@ describe('FullCompaction', () => {
       event: 'compaction_failed',
       properties: expect.objectContaining({
         source: 'manual',
-        tokens_before: 25,
+        tokens_before: 14_365,
         duration_ms: expect.any(Number),
         retry_count: 4,
         error_type: 'APIConnectionError',
@@ -1436,7 +1435,10 @@ describe('FullCompaction', () => {
   });
 
   it('auto-compacts very large context in one full-history round when the summarizer accepts it', async () => {
-    const maxContextTokens = 4_000;
+    // The window must stay above the harness's fixed request overhead
+    // (system prompt + tools, ~14k): the post-compaction size is reported on
+    // the full-request basis, so a smaller window could never be satisfied.
+    const maxContextTokens = 20_000;
     const ctx = testAgent();
     ctx.configure({
       provider: CATALOGUED_PROVIDER,
@@ -1463,7 +1465,7 @@ describe('FullCompaction', () => {
     const compactedPrefixSizes = ctx.llmCalls.map((call) =>
       estimateTokensForMessages(call.history.slice(0, -1)),
     );
-    expect(initialTokens).toBeGreaterThan(maxContextTokens * 9);
+    expect(initialTokens).toBeGreaterThan(maxContextTokens);
     expect(countEvents(events, 'full_compaction.complete')).toBe(1);
     expect(countEvents(events, 'compaction.completed')).toBe(1);
     expect(compactedPrefixSizes).toHaveLength(1);
@@ -1611,8 +1613,12 @@ describe('FullCompaction', () => {
       event: 'compaction_finished',
       properties: expect.objectContaining({
         source: 'auto',
-        tokens_before: 46,
-        tokens_after: 166,
+        tokens_before: 3_306,
+        // 3260 estimated request-overhead tokens (system prompt + tools) +
+        // 9 measured summary output tokens (scripted compaction exchange) +
+        // 21 estimated tokens for the kept user messages — the summary
+        // component is the REAL provider count, not a text estimate.
+        tokens_after: 3_290,
         compacted_count: 7,
         retry_count: 0,
       }),
@@ -1905,12 +1911,15 @@ describe('FullCompaction', () => {
 
   it('does not trigger auto compaction from a deferred loaded MCP schema', async () => {
     vi.stubEnv(MASTER_ENV, '1');
-    const ctx = testAgent({
-      initialConfig: {
-        providers: {},
-        loopControl: { reservedContextSize: 0 },
+    const ctx = testAgent(
+      agentService(IAgentToolSelectAnnouncementsService, { _serviceBrand: undefined }),
+      {
+        initialConfig: {
+          providers: {},
+          loopControl: { reservedContextSize: 0 },
+        },
       },
-    });
+    );
     const parameters = {
       type: 'object',
       properties: {
@@ -2144,6 +2153,71 @@ describe('FullCompaction', () => {
     await ctx.expectResumeMatches();
   });
 
+  it('recovers from compaction-request overflow under the measured token-counting strategy', async () => {
+    let callCount = 0;
+    const compactionInputLengths: number[] = [];
+    const generate: GenerateFn = async (_provider, _system, _tools, history, callbacks) => {
+      callCount += 1;
+      if (callCount === 1) {
+        throw new APIContextOverflowError(400, 'Context length exceeded', 'req-measured-overflow');
+      }
+      if (callCount === 2) {
+        // The compaction request itself overflows once; the backoff must
+        // shrink the history for the retry. A strategy-gated (all-zero)
+        // estimator would retry the SAME messages until the attempt limit and
+        // fail the turn.
+        compactionInputLengths.push(history.length);
+        throw new APIContextOverflowError(400, 'Context length exceeded', 'req-measured-shrink');
+      }
+      if (callCount === 3) {
+        compactionInputLengths.push(history.length);
+        return textResult('Measured-strategy compacted summary.');
+      }
+      if (callCount === 4) {
+        await callbacks?.onMessagePart?.({ type: 'text', text: 'Recovered under measured.' });
+        return textResult('Recovered under measured.');
+      }
+      throw new Error(`Unexpected generate call ${String(callCount)}`);
+    };
+    const ctx = testAgent({
+      generate,
+      initialConfig: {
+        providers: {},
+        tokenCounting: { strategy: 'measured' },
+      },
+    });
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: CATALOGUED_MODEL_CAPABILITIES,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
+    ctx.newEvents();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'Retry after measured overflow' }] });
+    const events = await ctx.untilTurnEnd();
+
+    expect(callCount).toBe(4);
+    expect(compactionInputLengths).toHaveLength(2);
+    expect(compactionInputLengths[1]!).toBeLessThan(compactionInputLengths[0]!);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: 'compaction.completed',
+        args: expect.objectContaining({
+          result: expect.objectContaining({
+            summary: 'Measured-strategy compacted summary.',
+          }),
+        }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: 'turn.ended',
+        args: { turnId: 0, reason: 'completed' },
+      }),
+    );
+    await ctx.expectResumeMatches();
+  });
+
   it('remembers the observed provider context window after overflow', async () => {
     let callCount = 0;
     const generate: GenerateFn = async (_provider, _system, _tools, _history, callbacks) => {
@@ -2215,6 +2289,38 @@ describe('FullCompaction', () => {
       }),
     );
     await ctx.expectResumeMatches();
+  });
+
+  it('triggers preemptive compaction against the declared input cap, not the total window', async () => {
+    let callCount = 0;
+    const generate: GenerateFn = async (_provider, _system, _tools, _history, callbacks) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return textResult('Preemptive summary under the input cap.');
+      }
+      await callbacks?.onMessagePart?.({ type: 'text', text: 'Answered after input-cap compaction.' });
+      return textResult('Answered after input-cap compaction.');
+    };
+    const ctx = testAgent({ generate });
+    ctx.configure({
+      provider: CATALOGUED_PROVIDER,
+      modelCapabilities: {
+        ...CATALOGUED_MODEL_CAPABILITIES,
+        max_context_tokens: 200_000,
+        max_input_tokens: 150_000,
+      },
+      tools: SNAPSHOT_VISIBLE_TOOLS,
+    });
+    ctx.appendExchange(1, 'old user one', 'old assistant one', 160_000);
+    ctx.newEvents();
+
+    await ctx.rpc.prompt({ input: [{ type: 'text', text: 'continue' }] });
+    const events = await ctx.untilTurnEnd();
+
+    expect(callCount).toBe(2);
+    expect(events).toContainEqual(
+      expect.objectContaining({ event: 'compaction.started' }),
+    );
   });
 
   it('honors the observed provider window over a declared input cap', async () => {
@@ -2409,8 +2515,6 @@ describe('FullCompaction', () => {
   it('preserves thinking effort when compacting after provider context overflow', async () => {
     let callCount = 0;
     const records: TelemetryRecord[] = [];
-    // The per-turn thinking intent captured from each generate call — the
-    // replacement for the morph-era provider `thinkingEffort` field.
     const thinkingEfforts: unknown[] = [];
     const generate: GenerateFn = async (_provider, _system, _tools, _history, callbacks, options) => {
       callCount += 1;
@@ -2626,8 +2730,6 @@ describe('FullCompaction', () => {
       ...models![CATALOGUED_PROVIDER.model]!,
       maxOutputSize: 64_000,
     };
-    // The config was mutated behind the services' backs — drop the assembled
-    // Model cache by hand or the request keeps the previous maxOutputSize.
     ctx.notifyModelConfigChanged();
     ctx.appendExchange(1, 'old user one', 'old assistant one', 20);
     ctx.newEvents();
@@ -2900,9 +3002,12 @@ function oauthTestAgentOptions(
       },
     },
     services: appServices((reg) => {
-      reg.definePartialInstance(IOAuthService, {
-        resolveTokenProvider: () => ({ getAccessToken }),
-      });
+      reg.defineInstance(IModelOAuthTokens, {
+        _serviceBrand: undefined,
+        hasCachedAccessToken: () => Promise.resolve(true),
+        getAccessToken: (_provider, _oauthRef, options) =>
+          getAccessToken(options?.force === true ? { force: true } : undefined),
+      } satisfies IModelOAuthTokens);
     }),
   };
 }
@@ -3236,7 +3341,7 @@ describe('goal reminder re-injection after full compaction', () => {
         lastCompactedTokenCount: number | null;
       }
     ).lastCompactedTokenCount;
-    expect(floor).toBe(ctx.get(IAgentContextSizeService).get().size);
+    expect(floor).toBe(ctx.get(IAgentTokenCountingService).get().size);
     expect(floor!).toBeGreaterThan(tokensAfter as number);
 
     ctx.mockNextResponse({ type: 'text', text: 'Reply after compaction.' });

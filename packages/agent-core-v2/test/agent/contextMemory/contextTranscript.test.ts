@@ -139,7 +139,6 @@ describe('reduceContextTranscript', () => {
         time: 220,
       },
       { type: 'context.append_loop_event', event: { type: 'step.end', uuid: 'st1' }, time: 230 },
-      // No record time → undefined (falls back to session createdAt + index).
       { type: 'context.append_message', message: userMessage('u2') },
     ]);
 
@@ -170,6 +169,25 @@ describe('reduceContextTranscript', () => {
       undo(1),
     ]);
     expect(texts(result)).toEqual(['message A', 'reply A']);
+  });
+
+  it('removes a pre-anchor image compression reminder owned by the undone prompt', () => {
+    const result = reduceContextTranscript([
+      appendMessage(
+        userMessage('compressed image', {
+          kind: 'injection',
+          variant: 'image_compression',
+          ownerPromptId: 'prompt-1',
+        }),
+      ),
+      appendMessage({ ...userMessage('undo me', { kind: 'user' }), id: 'prompt-1' }),
+      appendMessage(assistantMessage('undone answer')),
+      undo(1),
+      appendMessage(userMessage('keep me', { kind: 'user' })),
+      appendMessage(assistantMessage('kept answer')),
+    ]);
+
+    expect(texts(result)).toEqual(['keep me', 'kept answer']);
   });
 
   it('undo stops at a compaction summary', () => {

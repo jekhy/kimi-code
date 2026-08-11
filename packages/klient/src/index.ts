@@ -22,19 +22,17 @@ export {
   type SessionHandle,
 } from './core/klient.js';
 export type { KlientEvents } from './core/events/hub.js';
-export type { Caller, ScopedCaller } from './core/facade/global.js';
+export type { Caller, ScopedCaller, ScopedStreamCaller } from './core/facade/global.js';
 
 export type {
   ConfigTargetLiteral,
   GlobalAuthFacade,
-  GlobalCatalogFacade,
   GlobalConfigFacade,
   GlobalFacade,
   GlobalFlagsFacade,
   GlobalHostFsFacade,
-  GlobalModelsFacade,
+  GlobalKosongFacade,
   GlobalPluginsFacade,
-  GlobalProvidersFacade,
   GlobalSessionsFacade,
   GlobalWorkspacesFacade,
   KlientEnvInfo,
@@ -50,20 +48,34 @@ export type {
 } from './core/facade/global.js';
 
 export type {
+  AnonymousProviderInput,
+  GenerateEvent,
+  GenerateInput,
+  GenerateParams,
+  ProviderAuth,
+  ProviderInput,
+} from './core/facade/kosong-types.js';
+
+export type {
   SessionApprovalsFacade,
   SessionFacade,
   SessionInteractionsFacade,
   SessionQuestionsFacade,
+  SessionRestoreOptions,
+  SessionSkillsFacade,
   SessionStatus,
 } from './core/facade/session.js';
 export type {
+  AgentCommandInfo,
   AgentContextData,
   AgentFacade,
   AgentTaskInfo,
+  McpServerEntry,
   PlanData,
   PromptLaunchResult,
   SetModelResult,
   ShellCommandResult,
+  ThinkingLevel,
   UsageStatus,
 } from './core/facade/agent.js';
 
@@ -87,7 +99,7 @@ export type { Page } from '@moonshot-ai/agent-core-v2/persistence/interface/quer
 export type {
   Workspace,
   WorkspaceUpdate,
-} from '@moonshot-ai/agent-core-v2/app/workspaceRegistry/workspaceRegistry';
+} from '@moonshot-ai/agent-core-v2/app/workspace/workspace';
 export type {
   ConfigDiagnostic,
   ConfigInspectValue,
@@ -95,7 +107,6 @@ export type {
 export type { ProviderConfig } from '@moonshot-ai/agent-core-v2/kosong/provider/provider';
 export type { AuthStatus } from '@moonshot-ai/agent-core-v2/app/auth/auth';
 export type { ExperimentalFeatureState } from '@moonshot-ai/agent-core-v2/app/flag/flag';
-export type { ModelRecord } from '@moonshot-ai/agent-core-v2/kosong/model/model';
 export type {
   FsBrowseResponse,
   FsHomeResponse,
@@ -124,5 +135,6 @@ export type {
   Interaction,
   InteractionKind,
 } from '@moonshot-ai/agent-core-v2/session/interaction/interaction';
+export type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
 export type { ContentPart } from '@moonshot-ai/agent-core-v2/kosong/contract/message';
 export type { PermissionMode } from '@moonshot-ai/agent-core-v2/agent/permissionPolicy/types';

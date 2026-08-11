@@ -1,5 +1,5 @@
 /**
- * `kosong/model` domain (L2) — shared auth-material resolution.
+ * `kosong/model` domain — shared auth-material resolution.
  *
  * Resolves Model / Provider credential precedence for runtime model
  * resolution and auth-readiness probes. Pure computation, outside the
@@ -21,9 +21,9 @@
  */
 
 import { Error2 } from '#/_base/errors/errors';
+import { CONFIG_INVALID_ERROR_CODE } from '#/kosong/contract/errors';
 import type { ResolutionTrace } from '#/kosong/contract/inspection';
 
-import { ConfigErrors } from '../../app/config/errors';
 import {
   BUDGET_THINKING_EFFORTS,
   matchKnownAnthropicModelProfile,
@@ -36,12 +36,6 @@ import type { ModelRecord } from './model';
 import type { ResolvedModelAuthMaterial } from './model.types';
 import { drivesThinkingThroughTraits } from './thinking';
 
-/**
- * The Model → Provider credential precedence chain. When `trace` is given,
- * the winning layer (and any env-bag hit, by env-var name) is recorded at
- * `resolved.auth`; without a trace the function is the pure chain it always
- * was.
- */
 export function resolveModelAuthMaterial(
   args: {
     readonly modelId: string;
@@ -171,7 +165,7 @@ export function nonEmpty(value: string | undefined): string | undefined {
 
 function authConflictError(kind: string, name: string): Error2 {
   return new Error2(
-    ConfigErrors.codes.CONFIG_INVALID,
+    CONFIG_INVALID_ERROR_CODE,
     `${kind} "${name}" has both apiKey and oauth set in config.toml - they are mutually exclusive. Remove one.`,
   );
 }

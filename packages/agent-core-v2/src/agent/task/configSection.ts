@@ -1,5 +1,5 @@
 /**
- * `task` domain (L5) — task config-section schema and env bindings.
+ * `task` domain — task config-section schema and env bindings.
  *
  * Owns the `[task]` configuration section (task limits and lifecycle tuning).
  * The legacy `[background]` section is registered with the same schema so old
@@ -12,10 +12,8 @@
  * `stripEnvBoundFields` restores its env-free raw value before persistence, so
  * env values never leak into `config.toml`). Also owns the
  * `kimi -p` print-mode background policy (`printBackgroundMode` /
- * `printWaitCeilingS` / `printMaxTurns`), resolved with v1 semantics by
- * `resolvePrintBackgroundMode`. Self-registered
- * at module load via `registerConfigSection`, so the `config` domain never
- * imports this domain's types.
+ * `printWaitCeilingS` / `printMaxTurns`), resolved with v1 semantics.
+ * Self-registered at module load via `registerConfigSection`.
  */
 
 import { z } from 'zod';
@@ -40,6 +38,7 @@ export const AgentTaskConfigSchema = z.object({
   maxRunningTasks: z.number().int().min(1).optional(),
   keepAliveOnExit: z.boolean().optional(),
   bashAutoBackgroundOnTimeout: z.boolean().optional(),
+  bashTaskTimeoutS: z.number().int().min(0).optional(),
   killGracePeriodMs: z.number().int().min(0).optional(),
   printWaitCeilingS: z.number().int().min(1).optional(),
   printBackgroundMode: PrintBackgroundModeSchema.optional(),
@@ -56,18 +55,10 @@ export function resolveAgentTaskConfig(config: IConfigService): AgentTaskConfig 
   return { ...legacy, ...current };
 }
 
-/**
- * Resolve the effective print-mode (`kimi -p`) background-task policy, mirroring
- * v1's `Session.resolvePrintBackgroundMode`: `printBackgroundMode` is
- * authoritative when set; otherwise fall back to the legacy `keepAliveOnExit`
- * mapping (`true` ⇒ `'drain'`, otherwise `'exit'`). The
- * `KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT` env override is applied by the
- * config env overlay (see `taskEnvBindings`), so it is covered here.
- */
 export function resolvePrintBackgroundMode(config: IConfigService): PrintBackgroundMode {
   const section = resolveAgentTaskConfig(config);
   if (section?.printBackgroundMode !== undefined) return section.printBackgroundMode;
-  return section?.keepAliveOnExit === true ? 'drain' : 'exit';
+  return section?.keepAliveOnExit === true ? 'drain' : 'steer';
 }
 
 export const KEEP_ALIVE_ON_EXIT_ENV = 'KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT';

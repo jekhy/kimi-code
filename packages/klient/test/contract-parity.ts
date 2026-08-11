@@ -23,17 +23,33 @@ import type {
 } from '@moonshot-ai/agent-core-v2/agent/activityView/activityView';
 import type { AgentContextData } from '@moonshot-ai/agent-core-v2/agent/contextMemory/types';
 import type { TurnEndReason } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
-import type { PlanData } from '@moonshot-ai/agent-core-v2/agent/plan/plan';
+import type { PlanData } from '@moonshot-ai/agent-core-v2/features/plan/plan';
 import type {
+  ActivateSkillPayload,
   AgentAPI,
+  CancelPlanPayload,
+  CancelShellCommandPayload,
+  EmptyPayload,
+  GetTaskOutputPayload,
+  GetTasksPayload,
   PromptPart,
+  RunShellCommandPayload,
+  SetModelPayload,
+  SetModelResult,
+  ShellCommandResult,
+  StopTaskPayload,
 } from '@moonshot-ai/agent-core-v2/agent/rpc/core-api';
+import type { UsageStatus } from '@moonshot-ai/agent-core-v2/agent/usage/usage';
+import type { SkillSummary } from '@moonshot-ai/agent-core-v2/app/skillCatalog/types';
+import type { McpServerEntry } from '@moonshot-ai/agent-core-v2/mcpCore/connection-manager';
+import type { FullCompactionInput } from '@moonshot-ai/agent-core-v2/agent/fullCompaction/fullCompaction';
 import type { ISessionScopeHandle } from '@moonshot-ai/agent-core-v2/_base/di/scope';
 import type {
   CreateChildSessionOptions,
   CreateSessionOptions,
   ForkSessionOptions,
-} from '@moonshot-ai/agent-core-v2/app/sessionLifecycle/sessionLifecycle';
+  ResumeSessionOptions,
+} from '@moonshot-ai/agent-core-v2/workspace/sessionLifecycle/sessionLifecycle';
 import type {
   ApprovalRequest,
   ApprovalResponse,
@@ -66,6 +82,11 @@ import type {
   ConfigInspectValue,
   ConfigTarget,
 } from '@moonshot-ai/agent-core-v2/app/config/config';
+import type {
+  CapabilityInstallProgress,
+  CapabilityStatus,
+  CapabilityStep,
+} from '@moonshot-ai/agent-core-v2/app/capability/types';
 import type { ExperimentalFeatureState } from '@moonshot-ai/agent-core-v2/app/flag/flag';
 import type {
   FsBrowseResponse,
@@ -73,7 +94,7 @@ import type {
 } from '@moonshot-ai/agent-core-v2/app/hostFolderBrowser/hostFolderBrowser';
 import type { ModelRecord } from '@moonshot-ai/agent-core-v2/kosong/model/model';
 import type { IModelCatalog } from '@moonshot-ai/agent-core-v2/kosong/model/catalog';
-import type { IProviderDiscoveryService } from '@moonshot-ai/agent-core-v2/kosong/model/discovery';
+import type { IProviderDiscoveryService } from '@moonshot-ai/agent-core-v2/app/kosongConfig/discovery';
 import type {
   GetPluginInfoInput,
   InstallPluginInput,
@@ -100,16 +121,22 @@ import type {
 import type {
   Workspace,
   WorkspaceUpdate,
-} from '@moonshot-ai/agent-core-v2/app/workspaceRegistry/workspaceRegistry';
+} from '@moonshot-ai/agent-core-v2/app/workspace/workspace';
 // Test-only: `@moonshot-ai/protocol` is a devDependency; importing its types
 // here (never in `src/`) strengthens parity for the agent event stream.
 import type {
   AssistantDeltaEvent,
+  CompactionBlockedEvent,
+  CompactionCancelledEvent,
+  CompactionCompletedEvent,
+  CompactionStartedEvent,
   PromptAbortedEvent,
   PromptCompletedEvent,
   TaskInfo,
   ThinkingDeltaEvent,
+  ToolCallDeltaEvent,
   ToolCallStartedEvent,
+  ToolProgressEvent,
   ToolResultEvent,
   TurnEndedEvent,
   TurnStartedEvent,
@@ -129,8 +156,10 @@ import {
   turnPhaseSchema,
 } from '../src/contract/agent/activity.js';
 import {
+  agentCommandInfoSchema,
   agentContextDataSchema,
   agentTaskInfoSchema,
+  activateSkillPayloadSchema,
   cancelPayloadSchema,
   cancelPlanPayloadSchema,
   cancelShellCommandPayloadSchema,
@@ -141,6 +170,7 @@ import {
   promptLaunchResultSchema,
   promptPartSchema,
   promptPayloadSchema,
+  runCommandPayloadSchema,
   runShellCommandPayloadSchema,
   setModelPayloadSchema,
   setModelResultSchema,
@@ -153,10 +183,16 @@ import {
 } from '../src/contract/agent/rpc.js';
 import {
   assistantDeltaEventSchema,
+  compactionBlockedEventSchema,
+  compactionCancelledEventSchema,
+  compactionCompletedEventSchema,
+  compactionStartedEventSchema,
   promptAbortedEventSchema,
   promptCompletedEventSchema,
   thinkingDeltaEventSchema,
+  toolCallDeltaEventSchema,
   toolCallStartedEventSchema,
+  toolProgressEventSchema,
   toolResultEventSchema,
   turnEndedEventSchema,
   turnStartedEventSchema,
@@ -167,10 +203,15 @@ import {
   approvalResponseSchema,
 } from '../src/contract/session/approval.js';
 import {
+  fullCompactionInputSchema,
+  mcpServerEntrySchema,
+} from '../src/contract/agent/services.js';
+import {
   createChildSessionOptionsSchema,
   createSessionOptionsSchema,
   forkSessionOptionsSchema,
   handleWireSchema,
+  resumeSessionOptionsSchema,
 } from '../src/contract/session/lifecycle.js';
 import {
   interactionResolutionSchema,
@@ -190,6 +231,7 @@ import {
   questionResponseSchema,
   questionResultSchema,
 } from '../src/contract/session/question.js';
+import { skillSummarySchema } from '../src/contract/session/skills.js';
 
 import {
   authStatusSchema,
@@ -204,6 +246,11 @@ import {
   configInspectValueSchema,
   configTargetSchema,
 } from '../src/contract/global/config.js';
+import {
+  capabilityInstallProgressSchema,
+  capabilityStatusSchema,
+  capabilityStepSchema,
+} from '../src/contract/global/capabilities.js';
 import {
   modelCatalogItemSchema,
   providerCatalogItemSchema,
@@ -291,6 +338,14 @@ const _configInspectValue: AssertEngineToWire<typeof configInspectValueSchema, C
 const _configDiagnostic: AssertWire<typeof configDiagnosticSchema, ConfigDiagnostic> = true;
 const _configTarget: AssertWire<typeof configTargetSchema, ConfigTargetValues> = true;
 
+// capabilities.ts
+const _capabilityStep: AssertWire<typeof capabilityStepSchema, CapabilityStep> = true;
+const _capabilityInstallProgress: AssertWire<
+  typeof capabilityInstallProgressSchema,
+  CapabilityInstallProgress
+> = true;
+const _capabilityStatus: AssertWire<typeof capabilityStatusSchema, CapabilityStatus> = true;
+
 // providers.ts
 const _providerConfig: AssertWire<typeof providerConfigSchema, ProviderConfig> = true;
 
@@ -374,7 +429,8 @@ const _removePluginInput: AssertWire<typeof removePluginInputSchema, RemovePlugi
 const _getPluginInfoInput: AssertWire<typeof getPluginInfoInputSchema, GetPluginInfoInput> = true;
 
 // env.ts has no named schemas; `platform` narrows to `NodeJS.Platform` in the
-// engine — assert the bootstrap properties are all strings instead.
+// engine — assert the bootstrap properties are all strings instead. The
+// object-typed `clientIdentity` is intentionally not in this list.
 type _bootstrapStringProps = AssertStringProps<
   Pick<
     IBootstrapService,
@@ -384,7 +440,6 @@ type _bootstrapStringProps = AssertStringProps<
     | 'osHomeDir'
     | 'homeDir'
     | 'configPath'
-    | 'clientVersion'
     | 'sessionsDir'
     | 'blobsDir'
     | 'storeDir'
@@ -410,6 +465,8 @@ const _sessionMetadataChangedEvent: AssertWire<
 const _createSessionOptions: AssertWire<typeof createSessionOptionsSchema, CreateSessionOptions> =
   true;
 const _forkSessionOptions: AssertWire<typeof forkSessionOptionsSchema, ForkSessionOptions> = true;
+const _resumeSessionOptions: AssertWire<typeof resumeSessionOptionsSchema, ResumeSessionOptions> =
+  true;
 const _createChildSessionOptions: AssertWire<
   typeof createChildSessionOptionsSchema,
   CreateChildSessionOptions
@@ -441,6 +498,9 @@ const _questionAnswers: AssertWire<typeof questionAnswersSchema, QuestionAnswers
 const _questionResponse: AssertWire<typeof questionResponseSchema, QuestionResponse> = true;
 const _questionResult: AssertWire<typeof questionResultSchema, QuestionResult> = true;
 
+// session/skills.ts
+const _skillSummary: AssertWire<typeof skillSummarySchema, SkillSummary> = true;
+
 // agent/activity.ts
 const _turnPhase: AssertWire<typeof turnPhaseSchema, TurnPhase> = true;
 const _approvalRef: AssertWire<typeof approvalRefSchema, ApprovalRef> = true;
@@ -462,25 +522,19 @@ const _agentActivityState: AssertEngineToWire<typeof agentActivityStateSchema, A
   true;
 
 // ── agent scope (rpc.ts) ────────────────────────────────────────────────────
-// Payload/result types are reached through the `AgentAPI` interface so the
-// assertions track the exact methods the contract mirrors.
+// Payload/result types for the remaining `AgentAPI` methods are reached
+// through the interface so the assertions track the exact methods the
+// contract mirrors; payloads of the domain services the facade calls
+// directly (shellCommand / profile / usage / plan / task) are imported from
+// `core-api.ts` (they no longer have `AgentAPI` entries).
 type PromptPayload = Parameters<AgentAPI['prompt']>[0];
 type PromptLaunchResult = NonNullable<ReturnType<AgentAPI['prompt']>>;
 type SteerPayload = Parameters<AgentAPI['steer']>[0];
 type CancelPayload = Parameters<AgentAPI['cancel']>[0];
-type RunShellCommandPayload = Parameters<AgentAPI['runShellCommand']>[0];
-type ShellCommandResult = ReturnType<AgentAPI['runShellCommand']>;
-type CancelShellCommandPayload = Parameters<AgentAPI['cancelShellCommand']>[0];
-type SetModelPayload = Parameters<AgentAPI['setModel']>[0];
-type SetModelResult = ReturnType<AgentAPI['setModel']>;
 type SetPermissionPayload = Parameters<AgentAPI['setPermission']>[0];
-type UsageStatus = ReturnType<AgentAPI['getUsage']>;
+type AgentCommandInfo = Awaited<ReturnType<AgentAPI['listCommands']>>[number];
+type RunCommandPayload = Parameters<AgentAPI['runCommand']>[0];
 type TokenUsage = NonNullable<UsageStatus['total']>;
-type GetTasksPayload = Parameters<AgentAPI['getTasks']>[0];
-type StopTaskPayload = Parameters<AgentAPI['stopTask']>[0];
-type GetTaskOutputPayload = Parameters<AgentAPI['getTaskOutput']>[0];
-type CancelPlanPayload = Parameters<AgentAPI['cancelPlan']>[0];
-type EmptyPayload = Parameters<AgentAPI['getModel']>[0];
 
 const _emptyPayload: AssertWire<typeof emptyPayloadSchema, EmptyPayload> = true;
 const _promptPart: AssertWire<typeof promptPartSchema, PromptPart> = true;
@@ -489,6 +543,8 @@ const _promptPart: AssertWire<typeof promptPartSchema, PromptPart> = true;
 // `PromptPart` subset clients may send, so the reverse direction fails.
 const _promptPayload: AssertWireToEngine<typeof promptPayloadSchema, PromptPayload> = true;
 const _steerPayload: AssertWireToEngine<typeof steerPayloadSchema, SteerPayload> = true;
+const _activateSkillPayload: AssertWire<typeof activateSkillPayloadSchema, ActivateSkillPayload> =
+  true;
 const _promptLaunchResult: AssertWire<typeof promptLaunchResultSchema, PromptLaunchResult> = true;
 const _cancelPayload: AssertWire<typeof cancelPayloadSchema, CancelPayload> = true;
 const _runShellCommandPayload: AssertWire<
@@ -509,6 +565,8 @@ const _usageStatus: AssertWire<typeof usageStatusSchema, UsageStatus> = true;
 // One-directional: `history` entries are full `ContextMessage`s (deep
 // `Message`/`Tool`/`PromptOrigin` unions) mirrored as `unknown`.
 const _agentContextData: AssertEngineToWire<typeof agentContextDataSchema, AgentContextData> = true;
+const _agentCommandInfo: AssertWire<typeof agentCommandInfoSchema, AgentCommandInfo> = true;
+const _runCommandPayload: AssertWire<typeof runCommandPayloadSchema, RunCommandPayload> = true;
 const _planData: AssertWire<typeof planDataSchema, PlanData> = true;
 const _cancelPlanPayload: AssertWire<typeof cancelPlanPayloadSchema, CancelPlanPayload> = true;
 const _getTasksPayload: AssertWire<typeof getTasksPayloadSchema, GetTasksPayload> = true;
@@ -518,6 +576,11 @@ const _getTasksPayload: AssertWire<typeof getTasksPayloadSchema, GetTasksPayload
 const _agentTaskInfo: AssertWire<typeof agentTaskInfoSchema, TaskInfo> = true;
 const _stopTaskPayload: AssertWire<typeof stopTaskPayloadSchema, StopTaskPayload> = true;
 const _getTaskOutputPayload: AssertWire<typeof getTaskOutputPayloadSchema, GetTaskOutputPayload> =
+  true;
+
+// agent/services.ts (mcp / fullCompaction)
+const _mcpServerEntry: AssertWire<typeof mcpServerEntrySchema, McpServerEntry> = true;
+const _fullCompactionInput: AssertWire<typeof fullCompactionInputSchema, FullCompactionInput> =
   true;
 
 // ── agent scope (events.ts) ─────────────────────────────────────────────────
@@ -533,10 +596,28 @@ const _toolCallStartedEvent: AssertEngineToWire<
   typeof toolCallStartedEventSchema,
   ToolCallStartedEvent
 > = true;
+const _toolCallDeltaEvent: AssertWire<typeof toolCallDeltaEventSchema, ToolCallDeltaEvent> = true;
+const _toolProgressEvent: AssertWire<typeof toolProgressEventSchema, ToolProgressEvent> = true;
 const _toolResultEvent: AssertWire<typeof toolResultEventSchema, ToolResultEvent> = true;
 const _promptCompletedEvent: AssertWire<typeof promptCompletedEventSchema, PromptCompletedEvent> =
   true;
 const _promptAbortedEvent: AssertWire<typeof promptAbortedEventSchema, PromptAbortedEvent> = true;
+const _compactionStartedEvent: AssertWire<
+  typeof compactionStartedEventSchema,
+  CompactionStartedEvent
+> = true;
+const _compactionBlockedEvent: AssertWire<
+  typeof compactionBlockedEventSchema,
+  CompactionBlockedEvent
+> = true;
+const _compactionCancelledEvent: AssertWire<
+  typeof compactionCancelledEventSchema,
+  CompactionCancelledEvent
+> = true;
+const _compactionCompletedEvent: AssertWire<
+  typeof compactionCompletedEventSchema,
+  CompactionCompletedEvent
+> = true;
 const _warningEvent: AssertWire<typeof warningEventSchema, WarningEvent> = true;
 // No parity assertions for `errorEventSchema`, `permissionApproval*Schema`,
 // and `agentStatusUpdatedEventSchema`: they are deliberately `z.looseObject`s

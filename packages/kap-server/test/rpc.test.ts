@@ -7,18 +7,22 @@ import {
   IAgentGoalService,
   IAgentLifecycleService,
   IAgentRPCService,
+  IAgentShellCommandService,
   IAppendLogStore,
+  IDebugEventsService,
   IEventService,
   IPluginService,
   ISessionIndex,
-  ISessionLifecycleService,
   ISessionMetadata,
-  IWorkspaceRegistry,
+  ISessionLifecycleService,
+  IWorkspaceService,
+  getLiveSessionById,
 } from '@moonshot-ai/agent-core-v2';
 import type { ServiceIdentifier } from '@moonshot-ai/agent-core-v2';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { type RunningServer, startServer } from '../src/start';
+import { TEST_HOST_IDENTITY } from './helpers/hostIdentity';
 import { authHeaders } from './helpers/auth';
 
 interface Envelope<T> {
@@ -58,12 +62,14 @@ interface GoalToolResultWire {
 // name — exactly how the typed client composes URLs, so the test never hardcodes
 // a channel name that could drift from the token.
 function rpc(
-  scope: 'core' | 'session' | 'agent',
+  scope: 'core' | 'workspace' | 'session' | 'agent',
   service: ServiceIdentifier<unknown>,
   method: string,
-  ids: { sid?: string; aid?: string } = {},
+  ids: { wid?: string; sid?: string; aid?: string } = {},
 ): string {
   if (scope === 'core') return `/api/v1/debug/${String(service)}/${method}`;
+  if (scope === 'workspace')
+    return `/api/v1/debug/workspace/${ids.wid}/${String(service)}/${method}`;
   if (scope === 'session') return `/api/v1/debug/session/${ids.sid}/${String(service)}/${method}`;
   return `/api/v1/debug/session/${ids.sid}/agent/${ids.aid}/${String(service)}/${method}`;
 }
@@ -75,7 +81,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-rpc-'));
-    server = await startServer({ host: '127.0.0.1', port: 0, homeDir: home, logLevel: 'silent', debugEndpoints: true });
+    server = await startServer({ hostIdentity: TEST_HOST_IDENTITY, host: '127.0.0.1', port: 0, homeDir: home, logLevel: 'silent', debugEndpoints: true });
     base = `http://127.0.0.1:${server.port}`;
   });
 
@@ -130,13 +136,13 @@ describe('server-v2 /api/v1/debug RPC', () => {
   // The main agent scope is not created automatically on session creation
   // (server-v2 gap G10); create it here so the agent-scope dispatch resolves.
   async function createMainAgent(sessionId: string): Promise<void> {
-    const session = server!.core.accessor.get(ISessionLifecycleService).get(sessionId);
+    const session = getLiveSessionById(server!.core.accessor, sessionId);
     if (session === undefined) throw new Error(`session ${sessionId} not found`);
     await session.accessor.get(IAgentLifecycleService).create({ agentId: 'main' });
   }
 
   async function createSubagent(sessionId: string, agentId: string): Promise<void> {
-    const session = server!.core.accessor.get(ISessionLifecycleService).get(sessionId);
+    const session = getLiveSessionById(server!.core.accessor, sessionId);
     if (session === undefined) throw new Error(`session ${sessionId} not found`);
     await session.accessor.get(IAgentLifecycleService).create({ agentId });
   }
@@ -182,10 +188,32 @@ describe('server-v2 /api/v1/debug RPC', () => {
     expect(meta?.methods.map((m) => m.name)).not.toContain('dispose');
   });
 
+  it('reaches a runtime-contributed Service absent from /channels (decorator-name fallback)', async () => {
+    // IDebugEventsService comes from DebugEventsFeature's contributeService,
+    // which bypasses the static scoped registry: /channels omits it, but the
+    // dispatcher still resolves it through the global decorator registry.
+    const channels = await call<readonly { name: string }[]>(
+      'GET',
+      '/api/v1/debug/channels',
+    );
+    expect(channels.body.data.some((c) => c.name === String(IDebugEventsService))).toBe(false);
+
+    const { status, body } = await call<{
+      subscriptions: unknown[];
+      buses: unknown[];
+      globalListeners?: number;
+    }>('GET', rpc('core', IDebugEventsService, 'subscriptions'));
+    expect(status).toBe(200);
+    expect(body.code).toBe(0);
+    expect(Array.isArray(body.data.subscriptions)).toBe(true);
+    expect(Array.isArray(body.data.buses)).toBe(true);
+    expect(typeof body.data.globalListeners).toBe('number');
+  });
+
   it('lists sessions via GET', async () => {
     const { body } = await call<{ items: unknown[]; has_more: boolean }>(
       'GET',
-      rpc('core', ISessionIndex, 'list'),
+      rpc('core', ISessionIndex, 'listRecent'),
       {},
     );
     expect(body.code).toBe(0);
@@ -196,7 +224,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const cwd = home as string;
     const created = await call<{ id: string; root: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       cwd,
     );
     expect(created.body.code).toBe(0);
@@ -204,7 +232,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
     const got = await call<{ id: string; root: string }>(
       'GET',
-      rpc('core', IWorkspaceRegistry, 'get'),
+      rpc('core', IWorkspaceService, 'get'),
       created.body.data.id,
     );
     expect(got.body.code).toBe(0);
@@ -215,7 +243,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const missing = join(home as string, 'never-created');
     const { body } = await call<null>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       missing,
     );
     expect(body.code).toBe(40409);
@@ -225,14 +253,14 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const cwd = home as string;
     const created = await call<{ id: string; name: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'createOrTouch'),
+      rpc('core', IWorkspaceService, 'createOrTouch'),
       cwd,
     );
     const id = created.body.data.id;
 
     const updated = await call<{ id: string; name: string }>(
       'POST',
-      rpc('core', IWorkspaceRegistry, 'update'),
+      rpc('core', IWorkspaceService, 'update'),
       [id, { name: 'renamed' }],
     );
     expect(updated.body.code).toBe(0);
@@ -240,7 +268,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
     const got = await call<{ id: string; name: string }>(
       'GET',
-      rpc('core', IWorkspaceRegistry, 'get'),
+      rpc('core', IWorkspaceService, 'get'),
       id,
     );
     expect(got.body.data.name).toBe('renamed');
@@ -248,12 +276,12 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   it('counts active sessions', async () => {
     const cwd = home as string;
-    const created = await call<{ id: string }>('POST', rpc('core', IWorkspaceRegistry, 'createOrTouch'), cwd);
+    const created = await call<{ id: string }>('POST', rpc('core', IWorkspaceService, 'createOrTouch'), cwd);
     await createSession(cwd);
     const { body } = await call<number>(
       'POST',
-      rpc('core', ISessionIndex, 'countActive'),
-      [[created.body.data.id]],
+      rpc('core', ISessionIndex, 'count'),
+      [{ workspaceIds: [created.body.data.id] }],
     );
     expect(body.code).toBe(0);
     expect(body.data).toBeGreaterThanOrEqual(1);
@@ -288,8 +316,16 @@ describe('server-v2 /api/v1/debug RPC', () => {
 
   it('archives a session', async () => {
     const id = await createSession(home as string);
-    const { body } = await call<null>('POST', rpc('session', ISessionLifecycleService, 'archive', { sid: id }), id);
+    const workspaceId = (await server!.core.accessor.get(ISessionIndex).get(id))!.workspaceId;
+    const { body } = await call<null>(
+      'POST',
+      rpc('workspace', ISessionLifecycleService, 'archive', { wid: workspaceId }),
+      id,
+    );
     expect(body.code).toBe(0);
+    // archive is a method on the handler's session lifecycle service; its
+    // single argument is the session id.
+    expect(body.data).toBeNull();
   });
 
   // --- Agent scope ----------------------------------------------------------
@@ -380,13 +416,13 @@ describe('server-v2 /api/v1/debug RPC', () => {
     expect(meta.body.data.lastPrompt).toBe('should not become the title');
   });
 
-  it('runs a shell command through the RPC facade', async () => {
+  it('runs a shell command through the shell command service', async () => {
     const id = await createSession(home as string);
     await createMainAgent(id);
 
     const { body } = await call<{ stdout: string; stderr: string; isError?: boolean }>(
       'POST',
-      rpc('agent', IAgentRPCService, 'runShellCommand', { sid: id, aid: 'main' }),
+      rpc('agent', IAgentShellCommandService, 'run', { sid: id, aid: 'main' }),
       { command: 'printf hello' },
     );
     expect(body.code).toBe(0);
@@ -545,7 +581,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     const cwd = home as string;
     await createSession(cwd);
 
-    const listed = await call<{ items: { id: string }[] }>('POST', rpc('core', ISessionIndex, 'list'), {});
+    const listed = await call<{ items: { id: string }[] }>('POST', rpc('core', ISessionIndex, 'listRecent'), {});
     expect(listed.body.code).toBe(0);
     expect(listed.body.data.items.length).toBeGreaterThanOrEqual(1);
 
@@ -588,7 +624,7 @@ describe('server-v2 /api/v1/debug RPC', () => {
     let rejected = false;
     let code: number | undefined;
     try {
-      const res = await fetch(`${base}${rpc('core', ISessionIndex, 'list')}`, {
+      const res = await fetch(`${base}${rpc('core', ISessionIndex, 'listRecent')}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
         body: JSON.stringify({ big: huge }),
@@ -622,6 +658,7 @@ describe('server-v2 /api/v1/debug RPC auth', () => {
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-rpc-auth-'));
     server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
       host: '127.0.0.1',
       port: 0,
       homeDir: home,
@@ -643,14 +680,14 @@ describe('server-v2 /api/v1/debug RPC auth', () => {
   });
 
   it('rejects calls without a token (40101)', async () => {
-    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'list')}`, { method: 'POST' });
+    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'listRecent')}`, { method: 'POST' });
     expect(res.status).toBe(401);
     const body = (await res.json()) as Envelope<null>;
     expect(body.code).toBe(40101);
   });
 
   it('accepts calls with the correct rpcToken', async () => {
-    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'list')}`, {
+    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'listRecent')}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({}),
@@ -661,7 +698,7 @@ describe('server-v2 /api/v1/debug RPC auth', () => {
 
   it('accepts the persistent token on /api/v1/debug', async () => {
     const persistent = (server as RunningServer).authTokenService.getToken();
-    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'list')}`, {
+    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'listRecent')}`, {
       method: 'POST',
       headers: { authorization: `Bearer ${persistent}`, 'content-type': 'application/json' },
       body: JSON.stringify({}),
@@ -671,7 +708,7 @@ describe('server-v2 /api/v1/debug RPC auth', () => {
   });
 
   it('rejects a wrong token (40101)', async () => {
-    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'list')}`, {
+    const res = await fetch(`${base}${rpc('core', ISessionIndex, 'listRecent')}`, {
       method: 'POST',
       headers: { authorization: 'Bearer wrong' },
     });
@@ -689,6 +726,7 @@ describe('server-v2 /api/v1/debug RPC (dev-only, whitelist-free)', () => {
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'kimi-server-v2-debug-rpc-'));
     server = await startServer({
+      hostIdentity: TEST_HOST_IDENTITY,
       host: '127.0.0.1',
       port: 0,
       homeDir: home,
@@ -759,7 +797,7 @@ describe('server-v2 /api/v1/debug RPC (dev-only, whitelist-free)', () => {
   it('also reaches whitelisted Services by the same wire names', async () => {
     const { body } = await call<{ items: unknown[] }>(
       'POST',
-      `/api/v1/debug/${String(ISessionIndex)}/list`,
+      `/api/v1/debug/${String(ISessionIndex)}/listRecent`,
       [{ limit: 1 }],
     );
     expect(body.code).toBe(0);

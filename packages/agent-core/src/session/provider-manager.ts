@@ -1,6 +1,11 @@
 import type { Logger } from '#/logging/types';
 import type { ProviderConfig as KosongProviderConfig, ModelCapability, ProviderRequestAuth } from '@moonshot-ai/kosong';
-import { APIStatusError, getModelCapability, UNKNOWN_CAPABILITY } from '@moonshot-ai/kosong';
+import {
+  APIStatusError,
+  classifyKimiQuotaError,
+  getModelCapability,
+  UNKNOWN_CAPABILITY,
+} from '@moonshot-ai/kosong';
 import { parseKimiCodeCustomHeaders } from '@moonshot-ai/kimi-code-oauth';
 import {
   effectiveModelAlias,
@@ -94,6 +99,7 @@ export class ProviderManager implements ModelProvider {
       throw new KimiError(
         ErrorCodes.CONFIG_INVALID,
         `Model "${model}" is not configured in config.toml. Add a [models."${model}"] entry with max_context_size.`,
+        { details: { model } },
       );
     }
 
@@ -284,7 +290,12 @@ function toKosongProviderConfig(
         ...(maxOutputSize !== undefined ? { defaultMaxTokens: maxOutputSize } : {}),
         supportEfforts,
         ...(adaptiveThinking !== undefined ? { adaptiveThinking } : {}),
-        ...(provider.type === 'kimi' ? { kimiThinking: true } : {}),
+        // Kimi routed over the Anthropic transport keeps its vendor error
+        // classification: a Moonshot quota-exhausted 429 must fail fast here
+        // exactly as it does on the Kimi OpenAI transport.
+        ...(provider.type === 'kimi'
+          ? { kimiThinking: true, convertError: classifyKimiQuotaError }
+          : {}),
         ...(betaApi !== undefined ? { betaApi } : {}),
         // Session affinity: Anthropic's analog of OpenAI `prompt_cache_key` is
         // `metadata.user_id` on the Messages API (cache-affinity / end-user id).
@@ -329,7 +340,7 @@ function toKosongProviderConfig(
       return {
         type: 'kimi',
         model,
-        baseUrl: providerValue(provider.baseUrl, provider.env, 'KIMI_BASE_URL'),
+        baseUrl: modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'KIMI_BASE_URL'),
         apiKey: providerApiKey(provider),
         generationKwargs: { prompt_cache_key: promptCacheKey },
         ...defaultHeadersField({
@@ -342,7 +353,8 @@ function toKosongProviderConfig(
       return {
         type: 'google-genai',
         model,
-        baseUrl: providerValue(provider.baseUrl, provider.env, 'GOOGLE_GEMINI_BASE_URL'),
+        baseUrl:
+          modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'GOOGLE_GEMINI_BASE_URL'),
         apiKey: providerApiKey(provider),
         ...defaultHeadersField({
           ...envCustomHeaders,
@@ -373,7 +385,8 @@ function toKosongProviderConfig(
       // location detection, so the env fallback behaves exactly like
       // `base_url` — including deriving the region from an
       // `*-aiplatform.googleapis.com` host for the service-account path.
-      const baseUrl = providerValue(provider.baseUrl, provider.env, 'GOOGLE_VERTEX_BASE_URL');
+      const baseUrl =
+        modelBaseUrl ?? providerValue(provider.baseUrl, provider.env, 'GOOGLE_VERTEX_BASE_URL');
       const useServiceAccount = hasVertexAIServiceEnv(provider, baseUrl);
       return {
         type: 'vertexai',

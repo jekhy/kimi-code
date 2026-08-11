@@ -28,6 +28,7 @@ import type {
   TurnStepCompletedEvent,
   TurnStepInterruptedEvent,
   TurnStepStartedEvent,
+  TokenUsage,
   WarningEvent,
 } from '@moonshot-ai/kimi-code-sdk';
 
@@ -73,6 +74,7 @@ import { errorReportHintLine } from '../constant/feedback';
 import { formatStepDebugTiming } from '#/utils/usage/debug-timing';
 import { nextTranscriptId } from '../utils/transcript-id';
 import type { BtwPanelController } from './btw-panel';
+import { isPluginMcpToolName, PluginUpdateNotifier } from './plugin-update-notifier';
 import type { StreamingUIController } from './streaming-ui';
 import type { TasksBrowserController } from './tasks-browser';
 import { SubAgentEventHandler } from './subagent-event-handler';
@@ -103,6 +105,9 @@ export interface SessionEventHost {
   showNotice(title: string, detail?: string): void;
   updateActivityPane(): void;
   track(event: string, props?: Record<string, unknown>): void;
+  recordSessionActivity(): void;
+  noteStepUsage(usage: TokenUsage | undefined): void;
+  noteCompactionFinished(): void;
   mountEditorReplacement(panel: Component & Focusable): void;
   restoreEditor(): void;
   restoreInputText(text: string): void;
@@ -119,8 +124,12 @@ export interface SessionEventHost {
 
 export class SessionEventHandler {
   readonly subAgentEventHandler: SubAgentEventHandler;
+  private readonly pluginUpdateNotifier: PluginUpdateNotifier;
 
-  constructor(private readonly host: SessionEventHost) {
+  constructor(
+    private readonly host: SessionEventHost,
+    pluginUpdateNotifier?: PluginUpdateNotifier,
+  ) {
     this.subAgentEventHandler = new SubAgentEventHandler(host, {
       backgroundTasks: this.backgroundTasks,
       backgroundTaskTranscriptedTerminal: this.backgroundTaskTranscriptedTerminal,
@@ -128,6 +137,15 @@ export class SessionEventHandler {
         this.syncBackgroundTaskBadge();
       },
     });
+    this.pluginUpdateNotifier =
+      pluginUpdateNotifier ??
+      new PluginUpdateNotifier({
+        getSession: () => this.host.session,
+        workDir: host.state.appState.workDir,
+        notify: (message) => {
+          this.host.showStatus(message, 'warning');
+        },
+      });
   }
 
   // Runtime state – owned by this handler, reset between sessions.
@@ -142,6 +160,8 @@ export class SessionEventHandler {
   private goalCompletionAwaitingClear = false;
   private goalCompletionTurnEnded = false;
   private currentTurnHasAssistantText = false;
+  private pluginCommandTurns: Map<string, string> = new Map();
+  private pluginMcpToolsUsedInTurn: Set<string> = new Set();
   private pendingModelBlockedFallback: GoalChange | undefined;
   private queuedGoalPromotionPending = false;
   private queuedGoalPromotionInFlight = false;
@@ -158,6 +178,8 @@ export class SessionEventHandler {
     this.goalCompletionAwaitingClear = false;
     this.goalCompletionTurnEnded = false;
     this.currentTurnHasAssistantText = false;
+    this.pluginCommandTurns.clear();
+    this.pluginMcpToolsUsedInTurn.clear();
     this.pendingModelBlockedFallback = undefined;
     this.queuedGoalPromotionPending = false;
     this.queuedGoalPromotionInFlight = false;
@@ -293,9 +315,11 @@ export class SessionEventHandler {
   // Private handlers
   // ---------------------------------------------------------------------------
 
-  private handleTurnBegin(_event: TurnStartedEvent): void {
-    void _event;
+  private handleTurnBegin(event: TurnStartedEvent): void {
     this.currentTurnHasAssistantText = false;
+    if (event.origin?.kind === 'plugin_command') {
+      this.pluginCommandTurns.set(String(event.turnId), event.origin.pluginId);
+    }
     this.clearAgentSwarmProgress();
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.setStep(0);
@@ -345,9 +369,26 @@ export class SessionEventHandler {
     }
     this.host.streamingUI.resetToolUi();
     this.host.streamingUI.finalizeTurn(sendQueued);
+    this.host.recordSessionActivity();
     this.renderPendingModelBlockedFallback();
     this.currentTurnHasAssistantText = false;
     this.goalCompletionTurnEnded = true;
+    // Plugin usage is reported once the whole turn's output has ended — but a
+    // cancelled turn cut the output short, so skip the notice there.
+    const reportPluginUsage = event.reason !== 'cancelled';
+    const pluginCommandPluginId = this.pluginCommandTurns.get(String(event.turnId));
+    if (pluginCommandPluginId !== undefined) {
+      this.pluginCommandTurns.delete(String(event.turnId));
+      if (reportPluginUsage) {
+        void this.pluginUpdateNotifier.handlePluginCommandCompleted(pluginCommandPluginId);
+      }
+    }
+    if (reportPluginUsage) {
+      for (const toolName of this.pluginMcpToolsUsedInTurn) {
+        void this.pluginUpdateNotifier.handleMcpToolCompleted(toolName);
+      }
+    }
+    this.pluginMcpToolsUsedInTurn.clear();
     this.scheduleQueuedGoalPromotion();
   }
 
@@ -369,6 +410,7 @@ export class SessionEventHandler {
 
   private handleStepCompleted(event: TurnStepCompletedEvent): void {
     this.host.streamingUI.flushNow();
+    this.host.noteStepUsage(event.usage);
     this.maybeShowDebugTiming(event);
 
     if (event.providerFinishReason === 'filtered') {
@@ -582,6 +624,11 @@ export class SessionEventHandler {
       synthetic: event.synthetic,
     };
     const matchedCall = streamingUI.completeToolResult(event.toolCallId, resultData);
+    if (matchedCall !== undefined && isPluginMcpToolName(matchedCall.name)) {
+      // Buffer plugin MCP usage for the turn; the update notice fires once the
+      // whole turn's output has ended (see handleTurnEnd).
+      this.pluginMcpToolsUsedInTurn.add(matchedCall.name);
+    }
     this.subAgentEventHandler.handleAgentSwarmToolResult(
       event.toolCallId,
       resultData,
@@ -903,6 +950,13 @@ export class SessionEventHandler {
           'textMuted',
         );
         return;
+      case 'removed':
+        this.finalizeMcpServerStatusRow(
+          server.name,
+          `MCP server "${server.name}" removed`,
+          'textMuted',
+        );
+        return;
       case 'pending':
         this.showMcpServerStatusSpinner(server.name);
         return;
@@ -1000,6 +1054,12 @@ export class SessionEventHandler {
       event.result.tokensAfter,
       event.result.summary,
     );
+    // A completed compaction just refreshed and shrank the cached context —
+    // count it as activity so the next submit isn't judged against the
+    // pre-compaction timestamp, and reset the cache-break baseline (the drop
+    // is expected). Cancellations do neither: the context was not cut.
+    this.host.recordSessionActivity();
+    this.host.noteCompactionFinished();
     this.finishCompaction(sendQueued);
   }
 

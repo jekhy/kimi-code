@@ -185,6 +185,14 @@ export const BUILTIN_SLASH_COMMANDS = [
     availability: 'always',
   },
   {
+    name: 'secondary_model',
+    aliases: [],
+    description: 'Configure the secondary model for subagents',
+    priority: 90,
+    availability: 'always',
+    experimentalFlag: 'secondary-model',
+  },
+  {
     name: 'effort',
     aliases: ['thinking'],
     description: 'Switch thinking effort',
@@ -314,7 +322,7 @@ export const BUILTIN_SLASH_COMMANDS = [
   {
     name: 'fork',
     aliases: [],
-    description: 'Fork the current session',
+    description: 'Fork the current session into a copy without switching to it',
     priority: 80,
   },
   {
@@ -341,7 +349,7 @@ export const BUILTIN_SLASH_COMMANDS = [
   },
   {
     name: 'feedback',
-    aliases: [],
+    aliases: ['bug'],
     description: 'Send feedback to make Kimi Code better',
     priority: 60,
     availability: 'always',

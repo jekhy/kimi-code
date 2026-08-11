@@ -30,12 +30,13 @@ import {
 import type { AgentTaskSettlement } from '#/agent/task/types';
 import { userCancellationReason } from '#/_base/utils/abort';
 import type { IConfigService } from '#/app/config/config';
-import { ProcessTask } from '#/os/backends/node-local/tools/process-task';
+import { ProcessTask } from '#/agent/tools/os/bash/process-task';
 import type { IHostEnvironment } from '#/os/interface/hostEnvironment';
 import type { IAgentToolPolicyService } from '#/agent/toolPolicy/toolPolicy';
 import { type ISessionContext, makeSessionContext } from '#/session/sessionContext/sessionContext';
 import type { IProcess, ISessionProcessRunner } from '#/session/process/processRunner';
-import { type BashInput, BashInputSchema, BashTool } from '#/os/backends/node-local/tools/bash';
+import { type BashInput, BashInputSchema } from '#/agent/tools/os/bash/bash';
+import { BashTool } from '#/agent/tools/os/bash/bashTool';
 import type { ExecutableToolContext, ExecutableToolResult, ToolExecution } from '#/tool/toolContract';
 
 const posixEnv: IHostEnvironment = {
@@ -1162,7 +1163,7 @@ describe('BashTool', () => {
     expect(persisted.has(taskId!)).toBe(true);
     expect(output).toContain(`output_path: /fake/tasks/${taskId}/output.log`);
     expect(output).toContain('Use Read with output_path');
-    expect(output).toContain(`TaskOutput(task_id="${taskId}", block=false)`);
+    expect(output).toContain(`TaskOutput(task_id="${taskId}")`);
   });
 
   it('omits the TaskOutput hint from the saved-output reference when background tools are disabled', async () => {
@@ -1291,6 +1292,39 @@ describe('BashTool', () => {
     );
     expect(noBackground.description).not.toContain('moved to the background instead of being killed');
     expect(noBackground.description).toContain('hits its timeout is killed');
+  });
+
+  it('resolves the detach timeout from the bashTaskTimeoutS config', async () => {
+    async function detachTimeoutMsFor(
+      configValues: Record<string, unknown>,
+    ): Promise<number | undefined> {
+      const { runner } = createTestRunner(processWithOutput());
+      const { service, tasks } = createFakeTaskService();
+      const tool = bashTool(
+        runner,
+        createTestEnv(),
+        createTestCtx(),
+        service,
+        stubToolPolicy(),
+        stubConfig(configValues),
+      );
+
+      const result = await executeTool(
+        tool,
+        context({ command: 'watch', run_in_background: true, description: 'watch files' }),
+      );
+      expect(result).toMatchObject({ isError: false });
+
+      const taskId = service.list(false)[0]!.taskId;
+      return tasks.get(taskId)?.options.detachTimeoutMs;
+    }
+
+    await expect(detachTimeoutMsFor({})).resolves.toBe(600_000);
+    await expect(detachTimeoutMsFor({ task: { bashTaskTimeoutS: 30 } })).resolves.toBe(30_000);
+    await expect(detachTimeoutMsFor({ background: { bashTaskTimeoutS: 45 } })).resolves.toBe(
+      45_000,
+    );
+    await expect(detachTimeoutMsFor({ task: { bashTaskTimeoutS: 0 } })).resolves.toBe(0);
   });
 });
 

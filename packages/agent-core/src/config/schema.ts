@@ -93,6 +93,19 @@ export const ModelAliasSchema = ModelAliasBaseSchema.extend({
 
 export type ModelAlias = z.infer<typeof ModelAliasSchema>;
 
+/**
+ * The secondary-model recipe (`[secondary_model]` on disk): `model` points at
+ * a `[models]` entry and every remaining field is a subagent-only patch,
+ * materialized into a synthesized derived model entry at runtime (see
+ * `config/secondary-model.ts`). `default_effort` doubles as the subagent
+ * thinking effort.
+ */
+export const SecondaryModelConfigSchema = ModelAliasOverrideSchema.extend({
+  model: z.string().min(1).optional(),
+});
+
+export type SecondaryModelConfig = z.infer<typeof SecondaryModelConfigSchema>;
+
 export const ThinkingConfigSchema = z.object({
   enabled: z.boolean().optional(),
   effort: z.string().optional(),
@@ -172,6 +185,28 @@ export const SubagentConfigSchema = z.object({
 
 export type SubagentConfig = z.infer<typeof SubagentConfigSchema>;
 
+export const MAX_MCP_TIMEOUT_MS = 2_147_483_647;
+const McpTimeoutMsSchema = z.number().int().min(1).max(MAX_MCP_TIMEOUT_MS);
+
+export const McpConfigSchema = z.object({
+  /**
+   * Global default MCP server startup (connect + tool discovery) timeout in
+   * milliseconds. A per-server `startupTimeoutMs` in `mcp.json` and the
+   * KIMI_MCP_STARTUP_TIMEOUT_MS env var both win over this value. Defaults
+   * to 30s when unset.
+   */
+  startupTimeoutMs: McpTimeoutMsSchema.optional(),
+  /**
+   * Global default single MCP tool-call timeout in milliseconds. A
+   * per-server `toolTimeoutMs` in `mcp.json` and the
+   * KIMI_MCP_TOOL_TIMEOUT_MS env var both win over this value. Falls back to
+   * the client built-in default when unset.
+   */
+  toolTimeoutMs: McpTimeoutMsSchema.optional(),
+});
+
+export type McpConfig = z.infer<typeof McpConfigSchema>;
+
 export const ImageConfigSchema = z.object({
   /**
    * Longest-edge ceiling (px) applied when compressing images for the model.
@@ -233,8 +268,8 @@ export type ServicesConfig = z.infer<typeof ServicesConfigSchema>;
 
 const McpServerCommonFields = {
   enabled: z.boolean().optional(),
-  startupTimeoutMs: z.number().int().min(1).optional(),
-  toolTimeoutMs: z.number().int().min(1).optional(),
+  startupTimeoutMs: McpTimeoutMsSchema.optional(),
+  toolTimeoutMs: McpTimeoutMsSchema.optional(),
   enabledTools: z.array(z.string()).optional(),
   disabledTools: z.array(z.string()).optional(),
 } as const;
@@ -316,9 +351,12 @@ export const KimiConfigSchema = z.object({
   services: ServicesConfigSchema.optional(),
   mergeAllAvailableSkills: z.boolean().optional(),
   extraSkillDirs: z.array(z.string()).optional(),
+  extraAgentDirs: z.array(z.string()).optional(),
   loopControl: LoopControlSchema.optional(),
   background: BackgroundConfigSchema.optional(),
   subagent: SubagentConfigSchema.optional(),
+  secondaryModel: SecondaryModelConfigSchema.optional(),
+  mcp: McpConfigSchema.optional(),
   image: ImageConfigSchema.optional(),
   modelCatalog: ModelCatalogConfigSchema.optional(),
   experimental: ExperimentalConfigSchema.optional(),
@@ -335,6 +373,8 @@ const PermissionConfigPatchSchema = PermissionConfigSchema.partial();
 const LoopControlPatchSchema = LoopControlSchema.partial();
 const BackgroundConfigPatchSchema = BackgroundConfigSchema.partial();
 const SubagentConfigPatchSchema = SubagentConfigSchema.partial();
+const SecondaryModelConfigPatchSchema = SecondaryModelConfigSchema.partial();
+const McpConfigPatchSchema = McpConfigSchema.partial();
 const ImageConfigPatchSchema = ImageConfigSchema.partial();
 const ModelCatalogConfigPatchSchema = ModelCatalogConfigSchema.partial();
 const ExperimentalConfigPatchSchema = ExperimentalConfigSchema;
@@ -360,9 +400,12 @@ export const KimiConfigPatchSchema = z
     services: ServicesConfigPatchSchema.optional(),
     mergeAllAvailableSkills: z.boolean().optional(),
     extraSkillDirs: z.array(z.string()).optional(),
+    extraAgentDirs: z.array(z.string()).optional(),
     loopControl: LoopControlPatchSchema.optional(),
     background: BackgroundConfigPatchSchema.optional(),
     subagent: SubagentConfigPatchSchema.optional(),
+    secondaryModel: SecondaryModelConfigPatchSchema.optional(),
+    mcp: McpConfigPatchSchema.optional(),
     image: ImageConfigPatchSchema.optional(),
     modelCatalog: ModelCatalogConfigPatchSchema.optional(),
     experimental: ExperimentalConfigPatchSchema.optional(),

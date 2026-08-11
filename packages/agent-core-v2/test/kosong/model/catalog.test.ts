@@ -13,7 +13,7 @@
  *    definition's `hostHeaders`, and the Anthropic effort profile is inferred
  *    only for vendors whose thinking is not trait-driven;
  *  - `get`/`getRequester` cache per id; the cache drops on the
- *    model/provider change events — and ONLY there: a config write
+ *    model/provider change events — and ONLY there: a registry write
  *    that bypasses the events keeps serving the stale Model until
  *    `notifyConfigChanged()` (the load-bearing test-harness contract).
  */
@@ -23,7 +23,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createScopedTestHost } from '#/_base/di/test';
 import { isErrorCode } from '#/_base/errors/codes';
 import { isError2 } from '#/_base/errors/errors';
-import { IOAuthService } from '#/app/auth/auth';
 import { IConfigService } from '#/app/config/config';
 import { ConfigErrors } from '#/app/config/errors';
 import { UNKNOWN_CAPABILITY } from '#/kosong/contract/capability';
@@ -36,7 +35,11 @@ import '#/kosong/provider/bases/openai/index';
 import '#/kosong/provider/protocolAdapterRegistry';
 import '#/kosong/provider/providers/kimi/kimi.contrib';
 import '#/kosong/provider/providers/standard.contrib';
-import { IProviderService, type ProviderConfig } from '#/kosong/provider/provider';
+import {
+  IProviderService,
+  type ProviderConfig,
+  type ProvidersSection,
+} from '#/kosong/provider/provider';
 import '#/kosong/provider/providerService';
 import {
   globalDefaultForProvider,
@@ -49,17 +52,37 @@ import {
 } from '#/kosong/model/catalog';
 import { ModelCatalog } from '#/kosong/model/catalogService';
 import '#/kosong/model/errors';
-import { HostRequestHeaders, IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
-import { IModelService, type ModelRecord } from '#/kosong/model/model';
+import { IHostRequestHeaders } from '#/kosong/model/hostRequestHeaders';
+import { IModelService, type ModelRecord, type ModelsSection } from '#/kosong/model/model';
 import '#/kosong/model/modelService';
+import { IModelOAuthTokens } from '#/kosong/model/modelOAuth';
 
-import { StubConfigService, stubOAuthService, stubTokenProvider } from '../stubs';
+import { HostRequestHeadersAdapter } from '#/app/kosongConfig/hostRequestHeadersAdapter';
+
+import { StubConfigService, stubModelOAuthTokens, stubTokenProvider } from '../stubs';
+import { stubAgentIdentity } from '../../app/agentIdentity/stubs';
+import { stubBootstrap } from '../../app/bootstrap/stubs';
 
 const HOST_HEADERS = { 'User-Agent': 'kimi-test/1.0', 'X-Msh-Device-Id': 'device-1' };
 
+// The real adapter over the real snapshot builder, so these tests cover the
+// exact layers the port hands the catalog in production.
+function hostHeadersPort(spec: {
+  headers: Record<string, string>;
+  identitySlug?: string;
+}): IHostRequestHeaders {
+  return new HostRequestHeadersAdapter(
+    stubBootstrap('/home', {}, { requestHeaders: spec.headers }),
+    stubAgentIdentity({ slug: spec.identitySlug, hostRequestHeaders: spec.headers }),
+  );
+}
+
 function createHost(
   sections: Record<string, unknown> = {},
-  oauth: IOAuthService = stubOAuthService(),
+  oauthTokens: IModelOAuthTokens = stubModelOAuthTokens(),
+  hostHeaders: { headers: Record<string, string>; identitySlug?: string } = {
+    headers: HOST_HEADERS,
+  },
 ): {
   host: ReturnType<typeof createScopedTestHost>;
   config: StubConfigService;
@@ -70,15 +93,25 @@ function createHost(
   const config = new StubConfigService(sections);
   const host = createScopedTestHost([
     [IConfigService, config],
-    [IOAuthService, oauth],
-    [IHostRequestHeaders, new HostRequestHeaders(HOST_HEADERS)],
+    [IModelOAuthTokens, oauthTokens],
+    [IHostRequestHeaders, hostHeadersPort(hostHeaders)],
   ]);
+  const providers = host.app.accessor.get(IProviderService);
+  providers.loadAll(
+    (sections['providers'] ?? {}) as ProvidersSection,
+    sections['defaultProvider'] as string | undefined,
+  );
+  const models = host.app.accessor.get(IModelService);
+  models.loadAll(
+    (sections['models'] ?? {}) as ModelsSection,
+    sections['defaultModel'] as string | undefined,
+  );
   return {
     host,
     config,
     catalog: host.app.accessor.get(IModelCatalog) as ModelCatalog,
-    models: host.app.accessor.get(IModelService),
-    providers: host.app.accessor.get(IProviderService),
+    models,
+    providers,
   };
 }
 
@@ -90,6 +123,10 @@ const kimiSections: Record<string, unknown> = {
     k1: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 262144 },
   },
 };
+
+function silentModelWrite(models: IModelService, records: Record<string, ModelRecord>): void {
+  (models as unknown as { models: Record<string, ModelRecord> }).models = records;
+}
 
 let savedCustomHeaders: string | undefined;
 
@@ -116,7 +153,6 @@ describe('Model assembly (pure data)', () => {
       expect(model.baseUrl).toBe('https://api.moonshot.ai/v1');
       expect(model.maxContextSize).toBe(262144);
       expect(model.capabilities.max_context_tokens).toBe(262144);
-      // Kimi's definition declares `hostHeaders: 'full'`.
       expect(model.headers).toMatchObject({
         'User-Agent': 'kimi-test/1.0',
         'X-Msh-Device-Id': 'device-1',
@@ -158,6 +194,99 @@ describe('Model assembly (pure data)', () => {
     }
   });
 
+  describe('custom identity', () => {
+    const THIRD_PARTY = {
+      providers: {
+        openai: { type: 'openai', apiKey: 'sk-o', baseUrl: 'https://api.openai.com/v1' },
+      },
+      models: { gpt: { provider: 'openai', model: 'gpt-5', maxContextSize: 128000 } },
+    };
+    const OFFICIAL = {
+      providers: { kimi: { type: 'kimi', apiKey: 'sk', baseUrl: 'https://api.example.test/v1' } },
+      models: { k2: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 200000 } },
+    };
+
+    it('rewrites the User-Agent product token for third-party vendors', () => {
+      const { host, catalog } = createHost(THIRD_PARTY, stubModelOAuthTokens(), {
+        headers: HOST_HEADERS,
+        identitySlug: 'acme-dev',
+      });
+      try {
+        // Version preserved, product token swapped, device headers still absent.
+        expect(catalog.get('gpt').headers).toEqual({ 'User-Agent': 'acme-dev/1.0' });
+      } finally {
+        host.dispose();
+      }
+    });
+
+    it('preserves a parenthesized User-Agent suffix while rewriting', () => {
+      const { host, catalog } = createHost(THIRD_PARTY, stubModelOAuthTokens(), {
+        headers: { 'User-Agent': 'kimi-test/1.0 (web)' },
+        identitySlug: 'acme-dev',
+      });
+      try {
+        expect(catalog.get('gpt').headers).toEqual({ 'User-Agent': 'acme-dev/1.0 (web)' });
+      } finally {
+        host.dispose();
+      }
+    });
+
+    it('leaves full-header vendor requests byte-for-byte unchanged', () => {
+      // Vendors on the full-header path keep the host's own product token:
+      // that header set is built around it and backends key on it.
+      const { host, catalog } = createHost(OFFICIAL, stubModelOAuthTokens(), {
+        headers: HOST_HEADERS,
+        identitySlug: 'acme-dev',
+      });
+      try {
+        expect(catalog.get('k2').headers).toEqual(HOST_HEADERS);
+      } finally {
+        host.dispose();
+      }
+    });
+
+    it('changes nothing when no identity is configured', () => {
+      const { host, catalog } = createHost(THIRD_PARTY);
+      try {
+        expect(catalog.get('gpt').headers).toEqual({ 'User-Agent': 'kimi-test/1.0' });
+      } finally {
+        host.dispose();
+      }
+    });
+
+    it('never synthesizes a User-Agent the host did not provide', () => {
+      const { host, catalog } = createHost(THIRD_PARTY, stubModelOAuthTokens(), {
+        headers: {},
+        identitySlug: 'acme-dev',
+      });
+      try {
+        expect(catalog.get('gpt').headers).toEqual({});
+      } finally {
+        host.dispose();
+      }
+    });
+
+    // Inspection must attribute what the runtime actually sent — including a
+    // host that spells the header `user-agent`, which the finished layer
+    // canonicalizes.
+    it('attributes the User-Agent provenance for a lowercase host spelling', () => {
+      const { host, catalog } = createHost(THIRD_PARTY, stubModelOAuthTokens(), {
+        headers: { 'user-agent': 'kimi-test/1.0' },
+        identitySlug: 'acme-dev',
+      });
+      try {
+        expect(catalog.get('gpt').headers).toEqual({ 'User-Agent': 'acme-dev/1.0' });
+        const view = catalog.inspect('gpt');
+        expect(view.sources['resolved.headers.User-Agent']).toMatchObject({
+          kind: 'builtin',
+          detail: 'host User-Agent, product token from [identity] (acme-dev)',
+        });
+      } finally {
+        host.dispose();
+      }
+    });
+  });
+
   it('keeps an explicit foreign protocol for a kimi model (the dialect path)', () => {
     const { host, catalog } = createHost({
       providers: { kimi: { type: 'kimi', apiKey: 'sk', baseUrl: 'https://api.example.test/v1' } },
@@ -169,9 +298,7 @@ describe('Model assembly (pure data)', () => {
       const model = catalog.get('k2');
       expect(model.protocol).toBe('anthropic');
       expect(model.providerType).toBe('kimi');
-      // Anthropic base URLs strip the trailing `/v1`.
       expect(model.baseUrl).toBe('https://api.example.test');
-      // Kimi thinking is trait-driven: no Anthropic effort profile is inferred.
       expect(model.supportEfforts).toBeUndefined();
     } finally {
       host.dispose();
@@ -276,13 +403,11 @@ describe('Model assembly (pure data)', () => {
         project: 'my-project',
         location: 'us-central1',
       });
-      // The location is also discovered from a vertex-style baseUrl host.
       expect(catalog.get('v2').providerOptions).toEqual({
         vertexai: true,
         project: 'my-project',
         location: 'us-east4',
       });
-      // Without both coordinates there is no vertex mode and no options bag.
       expect(catalog.get('g').providerOptions).toBeUndefined();
     } finally {
       host.dispose();
@@ -356,12 +481,10 @@ describe('Model assembly (pure data)', () => {
     };
     expectInvalid(kimiSections, 'nope');
     expectInvalid({ models: { ghost: { provider: 'missing', model: 'm', maxContextSize: 1 } } }, 'ghost');
-    // Flat model with protocol + baseUrl but no wire-facing name.
     expectInvalid(
       { models: { noname: { protocol: 'openai', baseUrl: 'https://x.test', maxContextSize: 1 } } },
       'noname',
     );
-    // Structured kimi model without maxContextSize.
     expectInvalid(
       { ...kimiSections, models: { noctx: { provider: 'kimi', model: 'm' } } },
       'noctx',
@@ -389,19 +512,17 @@ describe('Model assembly (pure data)', () => {
 
   it('builds a refreshable OAuth auth provider for oauth-backed models', async () => {
     const tokenProvider = stubTokenProvider(['tok-1']);
-    const config = new StubConfigService({
-      providers: {
-        kimi: { type: 'kimi', oauth: { storage: 'file', key: 'kimi' }, baseUrl: 'https://api.moonshot.ai/v1' },
+    const { host, catalog } = createHost(
+      {
+        providers: {
+          kimi: { type: 'kimi', oauth: { storage: 'file', key: 'kimi' }, baseUrl: 'https://api.moonshot.ai/v1' },
+        },
+        models: { k1: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 1 } },
       },
-      models: { k1: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 1 } },
-    });
-    const host = createScopedTestHost([
-      [IConfigService, config],
-      [IOAuthService, stubOAuthService(tokenProvider)],
-      [IHostRequestHeaders, new HostRequestHeaders({})],
-    ]);
+      stubModelOAuthTokens(tokenProvider),
+    );
     try {
-      const model = (host.app.accessor.get(IModelCatalog) as ModelCatalog).get('k1');
+      const model = catalog.get('k1');
       expect(model.authProvider.canRefresh).toBe(true);
       await expect(model.authProvider.getAuth()).resolves.toEqual({ apiKey: 'tok-1' });
     } finally {
@@ -440,14 +561,12 @@ describe('ModelCatalog caching and config-event invalidation', () => {
     }
   });
 
-  it('keeps serving the stale Model on a silent config write until notifyConfigChanged()', async () => {
-    const { host, catalog, config } = createHost(kimiSections);
+  it('keeps serving the stale Model on a silent registry write until notifyConfigChanged()', async () => {
+    const { host, catalog, models } = createHost(kimiSections);
     try {
       const before = catalog.get('k1');
 
-      // Bypass the change events entirely: the catalog cache is the only
-      // stale layer, and only an explicit notify drops it.
-      config.setSilent('models', {
+      silentModelWrite(models, {
         k1: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 262144, displayName: 'silent' },
       });
       expect(catalog.get('k1')).toBe(before);
@@ -512,7 +631,6 @@ describe('ModelCatalog inspect', () => {
         kind: 'none',
       });
       expect(view.sources['resolved']).toMatchObject({ kind: 'synthesized' });
-      // Kimi's definition capability is UNKNOWN — nothing is detected.
       expect(view.sources['resolved.capabilities.tool_use']).toMatchObject({ kind: 'none' });
     } finally {
       host.dispose();
@@ -520,16 +638,14 @@ describe('ModelCatalog inspect', () => {
   });
 
   it('serves the same resolution as get (chain consistency, same cache generation)', () => {
-    const { host, catalog, config } = createHost(kimiSections);
+    const { host, catalog, models } = createHost(kimiSections);
     try {
       const model = catalog.get('k1');
       const view = catalog.inspect('k1');
       const { authProvider: _auth, id: _id, name, ...rest } = model;
       expect(view.resolved).toMatchObject({ ...rest, wireName: name });
 
-      // A silent config write keeps the stale generation: inspect reflects
-      // THAT generation (what get keeps serving), never a re-resolution.
-      config.setSilent('models', {
+      silentModelWrite(models, {
         k1: { provider: 'kimi', model: 'kimi-k2', maxContextSize: 262144, displayName: 'silent' },
       });
       expect(catalog.inspect('k1').resolved.displayName).toBeUndefined();
@@ -743,12 +859,7 @@ describe('ModelCatalog inspect', () => {
 
 describe('ModelCatalog ping', () => {
   it('returns the streamed text and usage on a live success', async () => {
-    const config = new StubConfigService(kimiSections);
-    const host = createScopedTestHost([
-      [IConfigService, config],
-      [IOAuthService, stubOAuthService()],
-      [IHostRequestHeaders, new HostRequestHeaders({})],
-    ]);
+    const { host, models, providers } = createHost(kimiSections, stubModelOAuthTokens());
     try {
       const fakeProvider: ChatProvider = {
         name: 'fake-base',
@@ -784,12 +895,11 @@ describe('ModelCatalog ping', () => {
         createChatProvider: () => fakeProvider,
       } as unknown as IProtocolAdapterRegistry;
       const catalog = new ModelCatalog(
-        config,
-        host.app.accessor.get(IProviderService),
-        host.app.accessor.get(IModelService),
-        host.app.accessor.get(IOAuthService),
+        providers,
+        models,
+        stubModelOAuthTokens(),
         registry,
-        new HostRequestHeaders({}),
+        { headers: {}, thirdPartyHeaders: {} },
       );
       const result = await catalog.ping('k1');
       expect(result).toMatchObject({ ok: true, text: 'pong', finishReason: 'completed' });
@@ -834,13 +944,6 @@ describe('ModelCatalog ping', () => {
 });
 
 
-/**
- * Enumeration & default-model selection: `listModels` / `listProviders` /
- * `getProvider` project the SAME materialization `get` serves (broken config
- * falls back to the config-only projection so it stays visible), and
- * `setDefaultModel` writes the global default pointer behind a
- * materialization gate.
- */
 
 const catalogSections: Record<string, unknown> = {
   providers: {
@@ -1142,8 +1245,6 @@ describe('ModelCatalog enumeration', () => {
       },
     });
     try {
-      // Conflicting inline credentials make materialization throw; the
-      // listing still shows the broken model with its config values.
       await expect(catalog.listModels()).resolves.toEqual([
         { provider: '', model: 'bad', display_name: 'Bad', max_context_size: 1000 },
       ]);
@@ -1199,16 +1300,12 @@ describe('ModelCatalog enumeration', () => {
   });
 
   it('marks an OAuth provider connected when a cached token exists', async () => {
-    const oauth = {
-      ...stubOAuthService(),
-      getCachedAccessToken: async () => 'cached-token',
-    } as unknown as IOAuthService;
     const { host, catalog } = createHost(
       {
         providers: { acme: { type: 'kimi', oauth: { storage: 'file', key: 'oauth/acme' } } },
         models: {},
       },
-      oauth,
+      stubModelOAuthTokens(undefined, 'cached-token'),
     );
     try {
       const [provider] = await catalog.listProviders();
@@ -1238,8 +1335,8 @@ describe('ModelCatalog enumeration', () => {
 });
 
 describe('ModelCatalog setDefaultModel', () => {
-  it('persists through config and returns the wire model', async () => {
-    const { host, config, catalog } = createHost(catalogSections);
+  it('moves the registry default pointer and returns the wire model', async () => {
+    const { host, models, catalog } = createHost(catalogSections);
     try {
       await expect(catalog.setDefaultModel('turbo')).resolves.toEqual({
         default_model: 'turbo',
@@ -1250,7 +1347,7 @@ describe('ModelCatalog setDefaultModel', () => {
           max_context_size: 32768,
         },
       });
-      expect(config.get<string>('defaultModel')).toBe('turbo');
+      expect(models.getDefaultModel()).toBe('turbo');
     } finally {
       host.dispose();
     }
@@ -1268,7 +1365,7 @@ describe('ModelCatalog setDefaultModel', () => {
   });
 
   it('rejects a model that fails materialization', async () => {
-    const { host, config, catalog } = createHost({
+    const { host, models, catalog } = createHost({
       providers: {},
       models: {
         bad: {
@@ -1281,7 +1378,7 @@ describe('ModelCatalog setDefaultModel', () => {
     });
     try {
       await expect(catalog.setDefaultModel('bad')).rejects.toThrow();
-      expect(config.get('defaultModel')).toBeUndefined();
+      expect(models.getDefaultModel()).toBeUndefined();
     } finally {
       host.dispose();
     }

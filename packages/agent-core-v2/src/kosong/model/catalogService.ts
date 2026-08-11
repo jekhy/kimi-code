@@ -1,5 +1,5 @@
 /**
- * `kosong/model` domain (L2) — `ModelCatalog`, the single place that builds
+ * `kosong/model` domain — `ModelCatalog`, the single place that builds
  * Models.
  *
  * Reads Model / Provider config, resolves the auth closure (provider-level
@@ -28,7 +28,9 @@
  * model/provider config-change events. Tests that mutate config
  * behind the services' backs (bypassing those events) must call
  * `notifyConfigChanged()` to drop the cache — otherwise `get` keeps serving
- * the previous generation's Model.
+ * the previous generation's Model. The host-header layers baked into an
+ * entry need no invalidation: both are frozen for the process (bootstrap
+ * args, and the identity snapshot behind the third-party layer).
  *
  * Inspection: every assembly also captures a `ResolutionTraceCollector`
  * (provenance records + intermediate artifacts, reference-only) alongside the
@@ -40,19 +42,24 @@
  * config-only projection for models that fail to materialize, so broken
  * config stays visible); `listProviders` / `getProvider` project the
  * provider registry plus credential state. `setDefaultModel` writes the
- * global default-model pointer (`DEFAULT_MODEL_SECTION`) after a
- * materialization gate — the catalog's only write. The remote-discovery
- * refresh lives in `kosong/provider/discovery`, not here.
+ * global default-model pointer (through `IModelService`) after a
+ * materialization gate — the catalog's only write.
+ *
+ * Outbound headers: vendors declaring `hostHeaders: 'full'` receive the host
+ * headers port's complete set and stay consistent with it — that set is the
+ * host's to define, and backends key on the product token it carries (log
+ * filtering, rollout gating). Everyone else receives the port's third-party
+ * layer, already finished on the app side (at most a `User-Agent`, product
+ * token per the configured identity) — this catalog picks a layer, it never
+ * edits one.
  */
 
 import { parseKimiCodeCustomHeaders } from '@moonshot-ai/kimi-code-oauth';
 
-import { InstantiationType } from '#/_base/di/extensions';
 import { Disposable } from '#/_base/di/lifecycle';
-import { LifecycleScope, registerScopedService } from '#/_base/di/scope';
+import { LifecycleScope } from '#/app/scopes';
+import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { Error2 } from '#/_base/errors/errors';
-import { IOAuthService } from '#/app/auth/auth';
-import { AuthErrors } from '#/app/auth/errors';
 import type { ModelCapability } from '#/kosong/contract/capability';
 import type { ProviderRequestAuth } from '#/kosong/contract/provider';
 import type { TokenUsage } from '#/kosong/contract/usage';
@@ -63,15 +70,13 @@ import {
   type ProtocolProviderOptions,
 } from '#/kosong/protocol/protocol';
 
-import { IConfigService } from '../../app/config/config';
-import { ConfigErrors } from '../../app/config/errors';
+import { CONFIG_INVALID_ERROR_CODE } from '#/kosong/contract/errors';
 import {
   LATEST_OPUS_PROFILE,
   matchKnownAnthropicModelProfile,
   matchUnknownClaudeProfile,
 } from '../provider/bases/anthropic/anthropic-profile';
 import {
-  DEFAULT_PROVIDER_SECTION,
   IProviderService,
   type ProviderConfig,
 } from '../provider/provider';
@@ -105,13 +110,14 @@ import {
   ResolutionTraceCollector,
   TRACE,
 } from './inspection';
-import { DEFAULT_MODEL_SECTION, IModelService, type ModelRecord } from './model';
+import { IModelService, type ModelRecord } from './model';
 import {
   deriveProviderId,
   effectiveModelConfig,
   nonEmpty,
   resolveModelAuthMaterial,
 } from './modelAuth';
+import { IModelOAuthTokens } from './modelOAuth';
 import type { ResolvedModelAuthMaterial } from './model.types';
 import type { ModelRequester } from './modelRequester';
 import { ModelRequesterImpl } from './modelRequesterImpl';
@@ -124,36 +130,28 @@ type MutableProtocolProviderOptions = {
 interface CatalogEntry {
   readonly model: Model;
   readonly requester: ModelRequester;
-  /** The provenance trace of the resolution that produced `model` (same pass). */
   readonly trace: ResolutionTraceCollector;
 }
 
+// NOTE: stays Disposable — its own 'get' collides with the Fiber
 export class ModelCatalog extends Disposable implements IModelCatalog {
   declare readonly _serviceBrand: undefined;
 
   private readonly cache = new Map<string, CatalogEntry>();
 
   constructor(
-    @IConfigService private readonly config: IConfigService,
     @IProviderService private readonly providers: IProviderService,
     @IModelService private readonly models: IModelService,
-    @IOAuthService private readonly oauth: IOAuthService,
+    @IModelOAuthTokens private readonly oauth: IModelOAuthTokens,
     @IProtocolAdapterRegistry
     private readonly protocolRegistry: IProtocolAdapterRegistry,
     @IHostRequestHeaders private readonly hostRequestHeaders: IHostRequestHeaders,
   ) {
     super();
-    // Cache invalidation rides the two config-change events; any change in
-    // either of them can alter an assembled Model, so the whole cache drops.
     this._register(this.models.onDidChangeModels(() => this.notifyConfigChanged()));
     this._register(this.providers.onDidChangeProviders(() => this.notifyConfigChanged()));
   }
 
-  /**
-   * Drop every assembled entry. Called by the config-change handlers; exposed
-   * so tests and harnesses that mutate config WITHOUT going through the
-   * change events can force re-assembly on the next `get`/`getRequester`.
-   */
   notifyConfigChanged(): void {
     this.cache.clear();
   }
@@ -190,9 +188,6 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
   }
 
   inspect(id: string): ModelInspection {
-    // The god object of the SAME resolution `get`/`getRequester` serve: the
-    // entry's trace was captured by that very pass, and the assembly (incl.
-    // secret redaction) re-runs on every call — inspect is never cached.
     const { model, trace } = this.entry(id);
     return assembleModelInspection({ id, model, trace });
   }
@@ -238,8 +233,6 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
       try {
         return toProtocolModel(this.get(modelId), record, providerType);
       } catch {
-        // Broken config must stay visible (and fixable) in listings: fall
-        // back to the config-only projection when materialization fails.
         return toProtocolModelFallback(modelId, record, providerType);
       }
     });
@@ -248,7 +241,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
   async listProviders(): Promise<readonly ProviderCatalogItem[]> {
     const providers = this.providers.list();
     const models = this.models.list();
-    const globalDefaultModel = this.config.get<string>(DEFAULT_MODEL_SECTION);
+    const globalDefaultModel = this.models.getDefaultModel();
     const out: ProviderCatalogItem[] = [];
     for (const [providerId, provider] of Object.entries(providers)) {
       out.push(await this.toCatalogProvider(providerId, provider, models, globalDefaultModel));
@@ -265,7 +258,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
       );
     }
     const models = this.models.list();
-    const globalDefaultModel = this.config.get<string>(DEFAULT_MODEL_SECTION);
+    const globalDefaultModel = this.models.getDefaultModel();
     return this.toCatalogProvider(providerId, provider, models, globalDefaultModel);
   }
 
@@ -277,10 +270,8 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
         `model ${modelId} does not exist`,
       );
     }
-    // Materialization gate: a model that cannot resolve (dangling provider
-    // reference, conflicting credentials, ...) must not become the default.
     const model = this.get(modelId);
-    await this.config.set(DEFAULT_MODEL_SECTION, modelId);
+    await this.models.setDefaultModel(modelId);
     return {
       default_model: modelId,
       model: toProtocolModel(model, record, this.providerTypeOf(record)),
@@ -309,17 +300,12 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
 
   private async hasCachedToken(providerId: string, provider: ProviderConfig): Promise<boolean> {
     if (provider.oauth === undefined) return false;
-    try {
-      const token = await this.oauth.getCachedAccessToken(providerId, provider.oauth);
-      return nonEmpty(token) !== undefined;
-    } catch {
-      return false;
-    }
+    return this.oauth.hasCachedAccessToken(providerId, provider.oauth);
   }
 
   private providerTypeOf(record: ModelRecord): string | undefined {
     const providerId =
-      record.providerId ?? record.provider ?? this.config.get<string>(DEFAULT_PROVIDER_SECTION);
+      record.providerId ?? record.provider ?? this.providers.getDefaultProvider();
     return this.providers.get(providerId ?? '')?.type ?? record.protocol;
   }
 
@@ -327,8 +313,9 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     const configuredModel = this.models.get(id);
     if (configuredModel === undefined) {
       throw new Error2(
-        ConfigErrors.codes.CONFIG_INVALID,
+        CONFIG_INVALID_ERROR_CODE,
         `Model "${id}" is not configured in config.toml.`,
+        { details: { model: id } },
       );
     }
     trace.capture(TRACE.configuredModel, configuredModel);
@@ -376,13 +363,13 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
         : rawBaseUrl;
     if (wireName === undefined) {
       throw new Error2(
-        ConfigErrors.codes.CONFIG_INVALID,
+        CONFIG_INVALID_ERROR_CODE,
         `Model "${id}" must define a wire-facing name in config.toml.`,
       );
     }
     if (model.maxContextSize === undefined) {
       throw new Error2(
-        ConfigErrors.codes.CONFIG_INVALID,
+        CONFIG_INVALID_ERROR_CODE,
         `Model "${id}" must define a positive max_context_size in config.toml.`,
       );
     }
@@ -412,6 +399,8 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     const declared = new Set((model.capabilities ?? []).map((c) => c.trim().toLowerCase()));
 
     trace.capture(TRACE.hostHeaders, this.hostRequestHeaders.headers);
+    trace.capture(TRACE.thirdPartyHeaders, this.hostRequestHeaders.thirdPartyHeaders);
+    trace.capture(TRACE.identitySlug, this.hostRequestHeaders.identitySlug);
     return {
       id,
       name: wireName,
@@ -421,7 +410,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
       headers: resolveOutboundHeaders(
         providerConfig?.type,
         providerConfig?.customHeaders,
-        this.hostRequestHeaders.headers,
+        this.hostRequestHeaders,
       ),
       capabilities,
       maxContextSize: model.maxContextSize,
@@ -449,7 +438,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     readonly resolvedBaseUrl: string | undefined;
   } {
     const providerId =
-      model.providerId ?? model.provider ?? this.config.get<string>('defaultProvider');
+      model.providerId ?? model.provider ?? this.providers.getDefaultProvider();
     if (providerId !== undefined) {
       trace.record('provider', {
         kind: 'config',
@@ -464,7 +453,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
       const providerConfig = this.providers.get(providerId);
       if (providerConfig === undefined) {
         throw new Error2(
-          ConfigErrors.codes.CONFIG_INVALID,
+          CONFIG_INVALID_ERROR_CODE,
           `Provider "${providerId}" referenced by model "${id}" is not configured.`,
         );
       }
@@ -505,7 +494,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     const modelBaseUrl = nonEmpty(model.baseUrl);
     if (modelBaseUrl === undefined) {
       throw new Error2(
-        ConfigErrors.codes.CONFIG_INVALID,
+        CONFIG_INVALID_ERROR_CODE,
         `Model "${id}" must set either providerId or baseUrl in config.toml.`,
       );
     }
@@ -523,12 +512,6 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     };
   }
 
-  /**
-   * The wire protocol: the Model's explicit `protocol` wins; otherwise the
-   * referenced provider's vendor identity resolves it — directly when the
-   * vendor type IS one of the four protocols, or through the vendor's first
-   * registration's `baseProtocol` (e.g. `kimi` → `openai`).
-   */
   private resolveProtocol(
     id: string,
     model: ModelRecord,
@@ -559,7 +542,7 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
       }
     }
     throw new Error2(
-      ConfigErrors.codes.CONFIG_INVALID,
+      CONFIG_INVALID_ERROR_CODE,
       `Model "${id}" must declare a wire protocol (config: models.<id>.protocol).`,
     );
   }
@@ -571,22 +554,13 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
     if (auth.oauth !== undefined) {
       const oauthRef = auth.oauth;
       const providerKey = auth.oauthProviderKey ?? providerName;
-      const oauthService = this.oauth;
-      const loginRequired = (cause?: unknown): Error2 =>
-        new Error2(
-          AuthErrors.codes.AUTH_LOGIN_REQUIRED,
-          `OAuth provider "${providerKey}" requires login before it can be used.`,
-          cause === undefined ? undefined : { cause },
-        );
+      const tokens = this.oauth;
       return {
         canRefresh: true,
         async getAuth(options): Promise<ProviderRequestAuth | undefined> {
-          const tokenProvider = oauthService.resolveTokenProvider(providerKey, oauthRef);
-          if (tokenProvider === undefined) throw loginRequired();
-          const apiKey = await tokenProvider.getAccessToken(
-            options?.force === true ? { force: true } : undefined,
-          );
-          if (apiKey.trim().length === 0) throw loginRequired();
+          const apiKey = await tokens.getAccessToken(providerKey, oauthRef, {
+            force: options?.force === true,
+          });
           return { apiKey };
         },
       };
@@ -598,21 +572,13 @@ export class ModelCatalog extends Disposable implements IModelCatalog {
 export function resolveOutboundHeaders(
   providerType: string | undefined,
   customHeaders: Readonly<Record<string, string>> | undefined,
-  hostHeaders: Readonly<Record<string, string>>,
+  host: Pick<IHostRequestHeaders, 'headers' | 'thirdPartyHeaders'>,
 ): Readonly<Record<string, string>> {
-  // How much of the host identity a vendor receives is declared on its
-  // provider definition (`hostHeaders: 'full'`); unregistered vendors get the
-  // User-Agent only, so device identity never leaks to unknown endpoints.
   const forwardsAll =
     providerType !== undefined &&
     getProviderDefinition(providerType)?.hostHeaders === 'full';
-  const hostLayer = forwardsAll ? hostHeaders : userAgentOnly(hostHeaders);
+  const hostLayer = forwardsAll ? host.headers : host.thirdPartyHeaders;
   return { ...parseKimiCodeCustomHeaders(), ...hostLayer, ...customHeaders };
-}
-
-function userAgentOnly(headers: Readonly<Record<string, string>>): Record<string, string> {
-  const userAgent = headers['User-Agent'];
-  return userAgent === undefined ? {} : { 'User-Agent': userAgent };
 }
 
 function resolveModelCapabilities(
@@ -662,9 +628,6 @@ function buildProtocolProviderOptions(
       break;
     }
     case 'google-genai': {
-      // Vertex AI is a `providerOptions` mode of this base, not a protocol:
-      // enable it when the provider env bag supplies both coordinates — the
-      // same discovery legacy `protocol: 'vertexai'` configs relied on.
       const project = vertexAIProject(provider);
       const location = vertexAILocation(provider, baseUrl);
       if (project !== undefined && location !== undefined) {
@@ -735,11 +698,6 @@ function locationFromVertexAIBaseUrl(baseUrl: string | undefined): string | unde
   }
 }
 
-/**
- * Credential detection through the provider-definition registry: the inline
- * `apiKey` wins, otherwise the vendor's declared `apiKeyEnv` chain is read
- * from the provider's config env bag.
- */
 function hasConfiguredApiKey(provider: ProviderConfig): boolean {
   if (nonEmpty(provider.apiKey) !== undefined) return true;
   if (provider.type === undefined) return false;
@@ -750,6 +708,6 @@ registerScopedService(
   LifecycleScope.App,
   IModelCatalog,
   ModelCatalog,
-  InstantiationType.Eager,
+  ScopeActivation.OnScopeCreated,
   'modelCatalog',
 );
